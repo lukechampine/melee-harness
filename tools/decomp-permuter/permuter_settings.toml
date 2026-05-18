@@ -1,0 +1,46 @@
+# put this in "nonmatchings"
+
+compiler_type = "mwcc"
+# Use manual compiler command that works
+compiler_command = "build/tools/wibo build/tools/sjiswrap.exe build/compilers/GC/1.2.5n/mwcceppc.exe -nowraplines -cwd source -Cpp_exceptions off -proc gekko -fp hardware -align powerpc -nosyspath -fp_contract on -O4,p -multibyte -enum int -nodefaults -inline auto -pragma 'cats off' -pragma 'warn_notinlined off' -RTTI off -str reuse -DBUILD_VERSION=0 -DVERSION_GALE01 -maxerrors 1 -msgstyle std -warn off -warn iserror -i src -i src/MSL -i src/Runtime -i extern/dolphin/include -i src/melee -i src/melee/ft/chara -i src/sysdolphin -lang=c -c"
+assembler_command = "build/binutils/powerpc-eabi-as -mgekko"
+asm_prelude_file = "tools/decomp-permuter/nonmatchings/prelude_ppc.inc"
+# Pattern for auto-detecting assembly files (src/path/file.c -> build/GALE01/asm/path/file.s)
+asm_pattern = "/src/ -> /build/GALE01/asm/"
+
+# uncomment lines below to customize randomization pass weights
+# see --help=randomization-passes for descriptions
+[weight_overrides]
+# perm_temp_for_expr = 100.0
+# perm_expand_expr = 20.0
+# perm_reorder_stmts = 10.0
+# perm_reorder_decls = 10.0
+# perm_add_mask = 15.0
+# perm_xor_zero = 0.5
+# perm_cast_simple = 10.0
+# perm_refer_to_var = 10.0
+# perm_float_literal = 3.0
+# perm_randomize_internal_type = 10.0
+# perm_randomize_external_type = 5.0
+# perm_randomize_function_type = 5.0
+# perm_split_assignment = 10.0
+# perm_sameline = 0.5
+# perm_ins_block = 10.0
+# perm_struct_ref = 0.5
+# perm_empty_stmt = 0.5
+# perm_condition = 10.0
+# perm_mult_zero = 5.0
+# perm_factor_mult = 5.0
+# perm_factor_shift = 5.0
+perm_dummy_comma_expr = 0.0
+# perm_add_self_assignment = 5.0
+# perm_commutative = 5.0
+# perm_add_sub = 5.0
+# perm_inequalities = 5.0
+# perm_compound_assignment = 0.5
+# perm_remove_ast = 5.0
+# perm_duplicate_assignment = 5.0
+# perm_chain_assignment = 10.0
+# perm_long_chain_assignment = 3.0
+# perm_pad_var_decl = 1.0
+# perm_inline = 10.0

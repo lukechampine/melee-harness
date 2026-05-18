@@ -1,0 +1,90 @@
+[package]
+name = "objdiff-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = """
+A local diffing tool for decompilation projects.
+"""
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "objdiff"
+path = "src/main.rs"
+
+[features]
+default = ["glow", "wgpu", "wsl"]
+glow = ["eframe/glow"]
+wgpu = ["eframe/wgpu", "dep:wgpu"]
+wsl = []
+
+[dependencies]
+anyhow = "1.0"
+argp = "0.4"
+cfg-if = "1.0"
+const_format = "0.2"
+cwdemangle = "1.0"
+dirs = "6.0"
+egui = "0.33"
+egui_extras = "0.33"
+egui-notify = "0.21"
+filetime = "0.2"
+float-ord = "0.3"
+font-kit = "0.14"
+globset = { version = "0.4", features = ["serde1"] }
+log = "0.4"
+objdiff-core = { path = "../objdiff-core", features = ["all"] }
+open = "5.3"
+png = "0.18"
+pollster = "0.4"
+regex = "1.12"
+rfd = { version = "0.15" } #, default-features = false, features = ['xdg-portal']
+rlwinmdec = "1.1"
+ron = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "local-offset"] }
+typed-path = "0.12"
+winit = { version = "0.30", features = ["default"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Keep version in sync with egui
+[dependencies.eframe]
+version = "0.33"
+features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+]
+default-features = false
+
+# Keep version in sync with eframe
+[dependencies.wgpu]
+version = "27.0"
+features = [
+    "dx12",
+    "metal",
+    "gles",
+    "vulkan",
+    "webgpu",
+]
+optional = true
+default-features = false
+
+[target.'cfg(windows)'.dependencies]
+winapi = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+exec = "0.3"
+
+[build-dependencies]
+anyhow = "1.0"
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"

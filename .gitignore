@@ -1,0 +1,15 @@
+# objdiff build output (8+ GB) — rebuild via README instructions
+objdiff/target/
+
+# objdiff fork's own Claude config — not part of the harness
+objdiff/.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# personal, per-machine — copy from settings.local.json.example
+.claude/settings.local.json
