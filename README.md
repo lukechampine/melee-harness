@@ -93,13 +93,13 @@ Driven by `permute.py` / `stack_permute.py` from the melee checkout.
 These are tracked deliberately so the overlay is honest about what isn't
 portable yet:
 
-1. **Hardcoded `/Users/luke/...` paths.** `.claude/settings.json` hooks invoke
-   `python3 /Users/luke/melee/tools/check_*.py`, and some scripts (e.g.
-   `checkdiff.py`) assume a fixed objdiff-cli location. These must be
-   parameterized (env var / repo-relative discovery) before this runs on
-   another machine.
-2. **`tools/project.py` diff.** The melee build-config changes live as a diff
+1. **`tools/project.py` diff.** The melee build-config changes live as a diff
    against the upstream tracked file and are not captured here; handle as a
    patch applied during setup.
-3. **Overlay wiring.** Symlink / stow these dirs into the melee checkout and add
+2. **Overlay wiring.** Symlink / stow these dirs into the melee checkout and add
    the paths to `melee/.git/info/exclude` so PRs stay clean.
+
+Resolved: the `.claude/settings.json` hooks now use `$CLAUDE_PROJECT_DIR`
+(set by Claude Code to the melee checkout root). The vendored tools invoke
+`objdiff-cli` via `PATH`, so they only require the `cargo install` step above —
+no hardcoded paths remain.
