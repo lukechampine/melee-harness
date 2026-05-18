@@ -36,6 +36,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from objdiff_path import objdiff_cli
+
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
@@ -64,7 +66,7 @@ def _objdiff_percent(target_o: Path, cand_o: Path, func_name: str) -> Optional[f
     try:
         result = subprocess.run(
             [
-                "objdiff-cli", "diff",
+                objdiff_cli(), "diff",
                 "--format", "percent",
                 "-c", "functionRelocDiffs=data_value",
                 "-1", str(target_o),

@@ -62,6 +62,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from objdiff_path import objdiff_cli
+
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
@@ -794,7 +796,7 @@ def compile_and_score(ws: Workspace, src_text: str) -> Optional[Tuple[int, int]]
         return None
     proc = subprocess.run(
         [
-            "objdiff-cli", "diff",
+            objdiff_cli(), "diff",
             "-1", str(ws.ref_obj),
             "-2", str(ws.temp_o),
             ws.func,
@@ -817,7 +819,7 @@ def read_match_pct(ws: Workspace) -> Optional[float]:
     must have already populated ``temp_o`` via ``compile_and_score``."""
     proc = subprocess.run(
         [
-            "objdiff-cli", "diff",
+            objdiff_cli(), "diff",
             "--format", "percent",
             "-c", "functionRelocDiffs=data_value",
             "-1", str(ws.ref_obj),

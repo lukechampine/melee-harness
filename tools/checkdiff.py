@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from objdiff_path import objdiff_cli
+
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
@@ -95,7 +97,7 @@ def run_diff(obj_path: str, func_name: str, fmt: str = "two-column", capture: bo
     our_obj = f"./build/GALE01/src/{obj_path}.o"
     return subprocess.run(
         [
-            "objdiff-cli", "diff",
+            objdiff_cli(), "diff",
             "--format", fmt,
             "-c", "functionRelocDiffs=data_value",
             "-1", ref_obj,

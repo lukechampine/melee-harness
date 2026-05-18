@@ -50,22 +50,26 @@ here.
 - local additions vs upstream: unix-style diffs, percent output, `-f stack`
   and `-f two-column` modes, `d=data` mark
 
-Requirements: Rust **1.88+** (edition 2024). Then:
+Requirements: Rust **1.88+** (edition 2024). Build and install it locally:
 
 ```sh
-cd objdiff
-cargo build --release -p objdiff-cli
-# binary at objdiff/target/release/objdiff-cli
+./setup.sh
 ```
 
-To put it on `PATH`:
+This runs a release build and installs the binary to `./bin/objdiff-cli`
+(both `objdiff/target/` and `/bin/` are gitignored). `Cargo.lock` is
+committed, so the build is dependency-pinned. Nothing is written to the
+system `PATH` or `~/.cargo/bin`.
 
-```sh
-cargo install --path objdiff/objdiff-cli
-# installs to ~/.cargo/bin/objdiff-cli
-```
+The tools resolve the binary via `tools/objdiff_path.py`, in this order:
 
-`Cargo.lock` is committed, so the build is dependency-pinned.
+1. `$OBJDIFF_CLI` — explicit override
+2. `<harness>/bin/objdiff-cli` — what `./setup.sh` installs
+3. `<harness>/objdiff/target/release/objdiff-cli` — raw cargo output
+4. `objdiff-cli` on `PATH` — last-resort fallback
+
+`<harness>` is located relative to the script (resolving symlinks), so this
+works whether the tools run in place or are symlinked into a melee checkout.
 
 ## Setting up decomp-permuter
 
@@ -99,7 +103,8 @@ portable yet:
 2. **Overlay wiring.** Symlink / stow these dirs into the melee checkout and add
    the paths to `melee/.git/info/exclude` so PRs stay clean.
 
-Resolved: the `.claude/settings.json` hooks now use `$CLAUDE_PROJECT_DIR`
-(set by Claude Code to the melee checkout root). The vendored tools invoke
-`objdiff-cli` via `PATH`, so they only require the `cargo install` step above —
-no hardcoded paths remain.
+Resolved: the `.claude/settings.json` hooks use `$CLAUDE_PROJECT_DIR` (set by
+Claude Code to the melee checkout root), and the tools resolve a
+harness-local `objdiff-cli` via `tools/objdiff_path.py` (`./setup.sh`
+installs it). No hardcoded paths remain and nothing depends on a
+system-wide `PATH`.

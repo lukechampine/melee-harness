@@ -1,5 +1,8 @@
-# objdiff build output (8+ GB) — rebuild via README instructions
+# objdiff build output (8+ GB) — rebuild via ./setup.sh
 objdiff/target/
+
+# locally-installed objdiff-cli — produced by ./setup.sh
+/bin/
 
 # objdiff fork's own Claude config — not part of the harness
 objdiff/.claude/
