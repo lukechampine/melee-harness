@@ -8,10 +8,12 @@ melee checkout so that none of this tooling can leak into upstream PRs.
 
 ```
 tools/                 custom decomp scripts (overlay onto melee/tools/)
-  decomp-permuter/     vendored decomp-permuter fork (setup below)
+permuter_settings.toml melee-specific decomp-permuter config; permute.py
+                       passes it via --settings (kept here, out of the fork)
 .claude/
   skills/              Claude Code skills (overlay onto melee/.claude/skills/)
-  settings.json        project hooks (see "Hardcoded paths" below)
+  hooks/               PostToolUse hook scripts, co-located with settings.json
+  settings.json        project hooks (reference $CLAUDE_PROJECT_DIR/.claude/hooks/)
 objdiff/               vendored objdiff-cli fork source (build instructions below)
 mwcc_debug/            mwcc_debug DLL source: patches MWCC v1.2.5n to emit
                        IR-optimizer + PPC-backend listings to pcdump.txt
@@ -19,6 +21,7 @@ mwcc_debug/            mwcc_debug DLL source: patches MWCC v1.2.5n to emit
 wibo/                  vendored wibo fork source:
                        fixes the formatoperands SIGBUS and the sjiswrap
                        nested-PE crash (build instructions below)
+decomp-permuter/       vendored decomp-permuter fork (setup below)
 ```
 
 ### tools/
@@ -32,8 +35,17 @@ wibo/                  vendored wibo fork source:
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
 | `mwcc_dump.py` | compile a TU with the mwcc_debug compiler → `pcdump.txt` |
-| `check_inline_vars.py` | hook: flags inlined-function patterns |
-| `check_type_erasing_casts.py` | hook: flags type-erasing casts |
+
+### .claude/hooks/
+
+PostToolUse hook scripts, kept next to `settings.json` so the `.claude/`
+overlay is self-contained (no dependency on `tools/`). `settings.json`
+invokes them as `uv run "$CLAUDE_PROJECT_DIR/.claude/hooks/<script>"`.
+
+| script | purpose |
+|---|---|
+| `check_inline_vars.py` | flags inlined-function patterns in the edited function |
+| `check_type_erasing_casts.py` | flags type-erasing casts / m2c residue in an edit |
 
 ### .claude/skills/
 
@@ -71,17 +83,21 @@ works whether the tools run in place or are symlinked into a melee checkout.
 
 ## Setting up decomp-permuter
 
-`tools/decomp-permuter/` is a vendored copy of a fork of
+`decomp-permuter/` is a vendored copy of a fork of
 [decomp-permuter](https://github.com/jellejurre/decomp-permuter):
 
 It uses [`uv`](https://docs.astral.sh/uv/); `uv.lock` is vendored, so:
 
 ```sh
-cd tools/decomp-permuter
+cd decomp-permuter
 uv sync
 ```
 
-Driven by `permute.py`.
+Driven by `permute.py`, which runs the permuter's `import.py` with
+`--settings <harness>/permuter_settings.toml` (the melee-specific config —
+`compiler_type`, `asm_pattern`, etc.). It lives at the harness root rather
+than inside the vendored fork, so the fork stays a clean upstream copy and
+no `permuter_settings.toml` is needed in the melee checkout.
 
 ## Building the mwcc_debug compiler + patched wibo
 

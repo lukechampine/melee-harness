@@ -47,9 +47,12 @@ ROOT = Path(
 )
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
-# Vendored decomp-permuter lives next to this script (in the harness),
-# not in the melee tree.
-PERMUTER = Path(__file__).resolve().parent / "decomp-permuter"
+# Vendored decomp-permuter and its melee-specific settings live at the
+# harness root (a top-level fork dir, out of the melee tree); the settings
+# are passed to import.py via --settings.
+_HARNESS = Path(__file__).resolve().parents[1]
+PERMUTER = _HARNESS / "decomp-permuter"
+PERMUTER_SETTINGS = _HARNESS / "permuter_settings.toml"
 NONMATCHINGS = ROOT / "nonmatchings"
 
 
@@ -236,6 +239,10 @@ def main() -> int:
                 str(asm_file),
                 "--function", func_name,
                 "--no-prune",
+                # Settings live at the harness root, not in the melee tree
+                # (find_root_dir still locates <melee> via build.ninja).
+                # Keeps the melee checkout copy-free.
+                "--settings", str(PERMUTER_SETTINGS),
             ],
             cwd=ROOT,
             capture_output=True,
