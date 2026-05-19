@@ -7,13 +7,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/tools/check_inline_vars.py\"",
+            "command": "uv run \"$CLAUDE_PROJECT_DIR/tools/check_inline_vars.py\"",
             "timeout": 10,
             "statusMessage": "Checking for inlined functions..."
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/tools/check_type_erasing_casts.py\"",
+            "command": "uv run \"$CLAUDE_PROJECT_DIR/tools/check_type_erasing_casts.py\"",
             "timeout": 10,
             "statusMessage": "Checking for type-erasing casts..."
           }
