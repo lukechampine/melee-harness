@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -25,7 +26,13 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).parents[1]
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 DEFAULT_ASM = ROOT / "build" / "GALE01" / "asm"
 
 INSN_RE = re.compile(r"^/\*[^*]*\*/\s+(\S+)\s*(.*?)\s*$")

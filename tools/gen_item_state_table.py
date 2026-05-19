@@ -6,11 +6,18 @@ Usage: python tools/gen_item_state_table.py <label>
 Example: python tools/gen_item_state_table.py it_803F93A8
 """
 
+import os
 import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 
 
 def find_source_file(label: str) -> Path:

@@ -64,7 +64,13 @@ from typing import Iterable, List, Optional, Tuple
 
 from objdiff_path import objdiff_cli
 
-ROOT = Path(__file__).resolve().parents[1]
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
 NONMATCHINGS = ROOT / "nonmatchings"

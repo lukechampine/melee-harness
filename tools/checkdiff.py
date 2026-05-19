@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,9 +32,17 @@ from typing import Optional
 
 from objdiff_path import objdiff_cli
 
-ROOT = Path(__file__).resolve().parents[1]
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
+# Sibling harness scripts live next to this one, not in the melee tree.
+TOOLS = Path(__file__).resolve().parent
 
 
 def find_unit_for_function(func_name: str) -> Optional[str]:
@@ -50,7 +59,7 @@ def auto_fix_frame(func_name: str) -> None:
     a strict improvement is available. Normal output is suppressed; only stderr
     (errors) is surfaced. For verbose stack-fix output, run stack_permute.py
     directly."""
-    stack_permute = ROOT / "tools" / "stack_permute.py"
+    stack_permute = TOOLS / "stack_permute.py"
     proc = subprocess.run(
         [sys.executable, str(stack_permute), func_name, "--fix-frame"],
         cwd=ROOT,
@@ -66,7 +75,7 @@ def build_unit(obj_path: str, fix_frame_funcs: Optional[list[str]] = None) -> bo
     build the translation unit. Returns True on success."""
     c_file = SRC_ROOT / f"{obj_path}.c"
 
-    fix_includes = ROOT / "tools" / "fix_includes.py"
+    fix_includes = TOOLS / "fix_includes.py"
     result = subprocess.run(
         [sys.executable, str(fix_includes), str(c_file)],
         cwd=ROOT,

@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[1]
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 COMPILE_COMMANDS = ROOT / "compile_commands.json"
 
 

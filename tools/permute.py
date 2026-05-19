@@ -38,10 +38,18 @@ from typing import Optional
 
 from objdiff_path import objdiff_cli
 
-ROOT = Path(__file__).resolve().parents[1]
+# Melee checkout root: explicit override, then Claude Code's project dir,
+# then assume this script lives at <melee>/tools/.
+ROOT = Path(
+    os.environ.get("MELEE_ROOT")
+    or os.environ.get("CLAUDE_PROJECT_DIR")
+    or Path(__file__).resolve().parents[1]
+)
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 SRC_ROOT = ROOT / "src"
-PERMUTER = ROOT / "tools/decomp-permuter"
+# Vendored decomp-permuter lives next to this script (in the harness),
+# not in the melee tree.
+PERMUTER = Path(__file__).resolve().parent / "decomp-permuter"
 NONMATCHINGS = ROOT / "nonmatchings"
 
 
