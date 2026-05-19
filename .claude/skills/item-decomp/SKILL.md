@@ -75,7 +75,7 @@ void it_802E1C4C(Item_GObj* gobj)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py it_802E1C4C
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py it_802E1C4C
 ```
 Output:
 ```
@@ -156,7 +156,7 @@ void itLinkarrow_UnkMotion1_Phys(Item_GObj* arg0)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py itLinkarrow_UnkMotion1_Phys
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py itLinkarrow_UnkMotion1_Phys
 ```
 Output:
 ```
@@ -196,7 +196,7 @@ void itLinkarrow_UnkMotion1_Phys(Item_GObj* gobj)
 
 Check that the function still matches:
 ```sh
-uv run tools/checkdiff.py itLinkarrow_UnkMotion1_Phys
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py itLinkarrow_UnkMotion1_Phys
 ```
 Output:
 ```
@@ -251,7 +251,7 @@ void it_80295748(Item_GObj* gobj, Point3d* pos)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py it_80295748
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py it_80295748
 ```
 Output:
 ```
@@ -274,7 +274,7 @@ void it_80295748(Item_GObj* gobj, Point3d* pos)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py it_80295748
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py it_80295748
 ```
 Output:
 ```
@@ -295,7 +295,7 @@ void it_80295748(Item_GObj* gobj, Vec3* pos)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py it_80295748
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py it_80295748
 ```
 Output:
 ```

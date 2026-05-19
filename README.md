@@ -1,17 +1,32 @@
 # melee-harness
 
 Personal decompilation harness for the [melee](https://github.com/doldecomp/melee)
-decomp project. This repo is **not** part of the melee tree — it overlays onto a
-melee checkout so that none of this tooling can leak into upstream PRs.
+decomp project.
+
+## Invoking the tools
+
+Every script in this repo's `tools/` (`checkdiff.py`, `stack_permute.py`,
+`permute.py`, `infer_struct.py`, `mwcc_dump.py`, `fix_includes.py`,
+`gen_item_state_table.py`) is run in place with `MELEE_ROOT` pointing at the
+melee checkout:
+
+```sh
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py <fn>
+```
+
+The scripts resolve the melee checkout as `$MELEE_ROOT`, then
+`$CLAUDE_PROJECT_DIR`, then (last resort) the script's parent dir — so set
+`MELEE_ROOT` explicitly for any manual invocation.
 
 ## Layout
 
 ```
-tools/                 custom decomp scripts (overlay onto melee/tools/)
+tools/                 custom decomp scripts (run in place via MELEE_ROOT)
+sync.sh                copy .claude/ overlay into a melee checkout
 permuter_settings.toml melee-specific decomp-permuter config; permute.py
-                       passes it via --settings (kept here, out of the fork)
+                       passes it via --settings
 .claude/
-  skills/              Claude Code skills (overlay onto melee/.claude/skills/)
+  skills/              Claude Code skills (copied into melee via ./sync.sh)
   hooks/               PostToolUse hook scripts, co-located with settings.json
   settings.json        project hooks (reference $CLAUDE_PROJECT_DIR/.claude/hooks/)
 objdiff/               vendored objdiff-cli fork source (build instructions below)
@@ -49,14 +64,21 @@ invokes them as `uv run "$CLAUDE_PROJECT_DIR/.claude/hooks/<script>"`.
 
 ### .claude/skills/
 
-`melee-decomp`, `easy-funcs`, `ground-decomp`, `item-decomp`, `decomp-progress`,
-`mismatch-db`, `opseq`.
+`melee-decomp`, `ground-decomp`, `item-decomp`, `decomp-progress`, `opseq`.
+
+### sync.sh
+
+Copies the `.claude/` overlay (skills, hooks, `settings.json`) from this repo
+into a melee checkout.
+
+```sh
+MELEE_ROOT=~/melee ./sync.sh   # defaults to ~/melee if MELEE_ROOT unset
+```
 
 ## Building the vendored tools
 
-`./setup.sh` builds all three vendored tools and installs them into `./bin`
-(gitignored) so the scripts resolve them locally without touching the system
-`PATH`:
+`./setup.sh` builds all three vendored tools and installs them into `./bin` so
+the scripts resolve them locally without touching the system `PATH`:
 
 | `bin/` artifact | source | needs |
 |---|---|---|
@@ -78,8 +100,8 @@ patch (below) is a separate step `setup.sh` prints at the end.
 3. `<harness>/objdiff/target/release/objdiff-cli` — raw cargo output
 4. `objdiff-cli` on `PATH` — last-resort fallback
 
-`<harness>` is located relative to the script (resolving symlinks), so this
-works whether the tools run in place or are symlinked into a melee checkout.
+`<harness>` is located relative to the script, so this works wherever the
+tools run in place from.
 
 ## Setting up decomp-permuter
 
@@ -134,11 +156,9 @@ to dump every basic block.
 1. `$MWCC_WIBO` — explicit override
 2. `<harness>/bin/wibo` — what `./setup.sh` installs
 3. `<harness>/wibo/build/release/wibo` — raw cmake output
-4. `<melee>/build/tools/wibo` — stock fallback (crashes; the script's
-   Wine fallback covers it)
+4. `<melee>/build/tools/wibo` — stock fallback
 
-`<harness>` is tried both as the melee sibling (the script runs as the
-melee `tools/` overlay copy) and relative to the script itself.
+`<harness>` is located relative to the script itself.
 
 ### Patch the compiler (per melee checkout)
 
@@ -158,15 +178,13 @@ stays in place so the normal melee build is unaffected.
 
 ### Usage
 
-From the melee checkout, after both builds:
-
 ```sh
-tools/mwcc_dump.py it_802E70BC   # -> ./pcdump.txt, that function only
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/mwcc_dump.py it_802E70BC
 ```
 
-The TU is resolved automatically, so you only name the function. If the
-function isn't in `pcdump.txt` (inlined away, or a wrong name), the full
-dump is left in place and the names that *are* present are listed.
+This writes a `pcdump.txt` into the melee checkout. If the function isn't in
+`pcdump.txt` (inlined away, or a wrong name), the full dump is left in place and
+the names that *are* present are listed.
 
 Defaults to the patched wibo with an automatic Wine fallback on SIGBUS
 (`--runner wibo` / `--runner wine` to force one).

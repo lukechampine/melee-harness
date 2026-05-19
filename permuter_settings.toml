@@ -4,7 +4,7 @@ compiler_type = "mwcc"
 # Use manual compiler command that works
 compiler_command = "build/tools/wibo build/tools/sjiswrap.exe build/compilers/GC/1.2.5n/mwcceppc.exe -nowraplines -cwd source -Cpp_exceptions off -proc gekko -fp hardware -align powerpc -nosyspath -fp_contract on -O4,p -multibyte -enum int -nodefaults -inline auto -pragma 'cats off' -pragma 'warn_notinlined off' -RTTI off -str reuse -DBUILD_VERSION=0 -DVERSION_GALE01 -maxerrors 1 -msgstyle std -warn off -warn iserror -i src -i src/MSL -i src/Runtime -i extern/dolphin/include -i src/melee -i src/melee/ft/chara -i src/sysdolphin -lang=c -c"
 assembler_command = "build/binutils/powerpc-eabi-as -mgekko"
-asm_prelude_file = "tools/decomp-permuter/nonmatchings/prelude_ppc.inc"
+asm_prelude_file = "/Users/luke/melee-harness/decomp-permuter/prelude_ppc.inc"
 # Pattern for auto-detecting assembly files (src/path/file.c -> build/GALE01/asm/path/file.s)
 asm_pattern = "/src/ -> /build/GALE01/asm/"
 

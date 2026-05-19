@@ -160,7 +160,7 @@ static void grBattle_8021A11C(Ground_GObj* gobj)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py grBattle_8021A11C
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py grBattle_8021A11C
 ```
 Output:
 ```diff
@@ -206,7 +206,7 @@ static void grBattle_8021A19C(Ground_GObj* gobj)
 
 Compile and check match:
 ```sh
-uv run tools/checkdiff.py grBattle_8021A19C
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py grBattle_8021A19C
 ```
 Output:
 ```diff

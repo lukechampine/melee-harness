@@ -25,8 +25,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +49,21 @@ SRC_ROOT = ROOT / "src"
 TOOLS = Path(__file__).resolve().parent
 
 
+@dataclass
+class BuildBlock:
+    rule: str
+    src: str
+    mw_version: str
+    cflags: str
+    extab_padding: Optional[str] = None
+
+
+@dataclass
+class CompiledObject:
+    obj: Path
+    tmpdir: tempfile.TemporaryDirectory
+
+
 def find_unit_for_function(func_name: str) -> Optional[str]:
     with REPORT_PATH.open("r") as f:
         for unit in json.load(f).get("units", []):
@@ -52,6 +71,138 @@ def find_unit_for_function(func_name: str) -> Optional[str]:
                 if function.get("name") == func_name:
                     return unit.get("name", "").removeprefix("main/")
     return None
+
+
+def find_build_block(obj_path: str) -> BuildBlock:
+    """Parse build.ninja for the MWCC build edge that produces obj_path."""
+    target = f"build/GALE01/src/{obj_path}.o"
+    text = (ROOT / "build.ninja").read_text()
+    # Unfold ninja line continuations so cflags can be read as one value.
+    text = text.replace("$\n", " ")
+
+    blocks = re.split(r"^build ", text, flags=re.M)
+    for block in blocks:
+        if not (block.startswith(f"{target}:") or block.startswith(f"{target} :")):
+            continue
+
+        build_line = block.splitlines()[0]
+        match = re.match(rf"{re.escape(target)}\s*:\s*(\S+)\s+(.+)", build_line)
+        if match is None:
+            raise RuntimeError(f"could not parse build edge for {target}")
+
+        rule = match.group(1)
+        explicit_inputs = re.split(r"\s+\|\|?\s+", match.group(2), maxsplit=1)[0]
+        inputs = shlex.split(explicit_inputs)
+        if not inputs:
+            raise RuntimeError(f"build edge for {target} has no source input")
+
+        vars = {
+            m.group(1): m.group(2).strip()
+            for m in re.finditer(r"^\s+([A-Za-z_][A-Za-z0-9_]*) = (.*)$", block, re.M)
+        }
+        try:
+            mw_version = vars["mw_version"]
+            cflags = vars["cflags"]
+        except KeyError as e:
+            raise RuntimeError(f"build edge for {target} is missing {e.args[0]}") from e
+
+        return BuildBlock(
+            rule=rule,
+            src=inputs[0],
+            mw_version=mw_version,
+            cflags=cflags,
+            extab_padding=vars.get("extab_padding"),
+        )
+
+    raise RuntimeError(f"no build edge for {target}")
+
+
+def direct_compile(obj_path: str) -> Optional[CompiledObject]:
+    """Compile one TU directly from its build.ninja MWCC settings.
+
+    The output goes to a unique temporary object, avoiding Ninja state and the
+    normal build-tree object path.
+    """
+    try:
+        block = find_build_block(obj_path)
+    except RuntimeError as e:
+        print(f"build.ninja lookup failed: {e}", file=sys.stderr)
+        return None
+
+    mwcc_rules = {"mwcc", "mwcc_sjis", "mwcc_extab", "mwcc_sjis_extab"}
+    if block.rule not in mwcc_rules:
+        print(f"unsupported build rule for direct compile: {block.rule}", file=sys.stderr)
+        return None
+
+    wibo = ROOT / "build/tools/wibo"
+    sjiswrap = ROOT / "build/tools/sjiswrap.exe"
+    dtk = ROOT / "build/tools/dtk"
+    compiler = ROOT / "build" / "compilers" / block.mw_version / "mwcceppc.exe"
+
+    required = [wibo, compiler]
+    if "sjis" in block.rule:
+        required.append(sjiswrap)
+    if "extab" in block.rule:
+        required.append(dtk)
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        print("missing build prerequisite(s):", file=sys.stderr)
+        for path in missing:
+            print(f"  {path}", file=sys.stderr)
+        print("run `ninja tools` once to fetch/build prerequisites", file=sys.stderr)
+        return None
+
+    build_tmp = ROOT / "build"
+    build_tmp.mkdir(exist_ok=True)
+    tmpdir = tempfile.TemporaryDirectory(prefix="checkdiff-", dir=build_tmp)
+    tmp_obj = Path(tmpdir.name) / f"{Path(obj_path).name}.o"
+
+    cmd = [str(wibo)]
+    if "sjis" in block.rule:
+        cmd.append(str(sjiswrap))
+    cmd += [
+        str(compiler),
+        *shlex.split(block.cflags),
+        "-MMD",
+        "-c",
+        block.src,
+        "-o",
+        str(tmp_obj),
+    ]
+
+    result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("direct compile failed:", file=sys.stderr)
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        tmpdir.cleanup()
+        return None
+
+    if not tmp_obj.exists():
+        objs = list(Path(tmpdir.name).glob("*.o"))
+        if len(objs) == 1:
+            tmp_obj = objs[0]
+        else:
+            print(f"direct compile did not produce {tmp_obj}", file=sys.stderr)
+            tmpdir.cleanup()
+            return None
+
+    if "extab" in block.rule:
+        padding = block.extab_padding or ""
+        result = subprocess.run(
+            [str(dtk), "extab", "clean", "--padding", padding, str(tmp_obj), str(tmp_obj)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print("extab post-processing failed:", file=sys.stderr)
+            print(result.stdout)
+            print(result.stderr, file=sys.stderr)
+            tmpdir.cleanup()
+            return None
+
+    return CompiledObject(obj=tmp_obj, tmpdir=tmpdir)
 
 
 def auto_fix_frame(func_name: str) -> None:
@@ -70,9 +221,11 @@ def auto_fix_frame(func_name: str) -> None:
         print(proc.stderr, file=sys.stderr, end="")
 
 
-def build_unit(obj_path: str, fix_frame_funcs: Optional[list[str]] = None) -> bool:
+def build_unit(
+    obj_path: str, fix_frame_funcs: Optional[list[str]] = None
+) -> Optional[CompiledObject]:
     """Fix includes, optionally run --fix-frame on each named function, then
-    build the translation unit. Returns True on success."""
+    compile the translation unit. Returns the temporary object on success."""
     c_file = SRC_ROOT / f"{obj_path}.c"
 
     fix_includes = TOOLS / "fix_includes.py"
@@ -84,33 +237,30 @@ def build_unit(obj_path: str, fix_frame_funcs: Optional[list[str]] = None) -> bo
     if result.returncode != 0:
         print(f"fix_includes.py failed:", file=sys.stderr)
         print(result.stderr.decode(), file=sys.stderr)
-        return False
+        return None
 
     for func_name in (fix_frame_funcs or []):
         auto_fix_frame(func_name)
 
-    our_obj = f"./build/GALE01/src/{obj_path}.o"
-    result = subprocess.run(["ninja", our_obj], cwd=ROOT, capture_output=True, text=True)
-    if result.returncode != 0:
-        print("ninja failed:", file=sys.stderr)
-        print(result.stdout)
-        print(result.stderr, file=sys.stderr)
-        return False
-
-    return True
+    return direct_compile(obj_path)
 
 
-def run_diff(obj_path: str, func_name: str, fmt: str = "two-column", capture: bool = False):
+def run_diff(
+    obj_path: str,
+    candidate_obj: Path,
+    func_name: str,
+    fmt: str = "two-column",
+    capture: bool = False,
+):
     """Run objdiff-cli. Returns CompletedProcess."""
     ref_obj = f"./build/GALE01/obj/{obj_path}.o"
-    our_obj = f"./build/GALE01/src/{obj_path}.o"
     return subprocess.run(
         [
             objdiff_cli(), "diff",
             "--format", fmt,
             "-c", "functionRelocDiffs=data_value",
             "-1", ref_obj,
-            "-2", our_obj,
+            "-2", str(candidate_obj),
             func_name,
         ],
         cwd=ROOT,
@@ -131,13 +281,14 @@ def resolve_functions(func_names: list[str]) -> dict[str, list[str]]:
     return func_units
 
 
-def build_units(func_units: dict[str, list[str]], fix_frame: bool) -> set[str]:
-    """Build each translation unit once. Returns set of successfully built paths.
-    If `fix_frame` is True, runs --fix-frame on every function before the build."""
-    built: set[str] = set()
+def build_units(func_units: dict[str, list[str]], fix_frame: bool) -> dict[str, CompiledObject]:
+    """Compile each translation unit once. Returns compiled objects by path.
+    If `fix_frame` is True, runs --fix-frame on every function first."""
+    built: dict[str, CompiledObject] = {}
     for obj_path, funcs in func_units.items():
-        if build_unit(obj_path, funcs if fix_frame else None):
-            built.add(obj_path)
+        compiled = build_unit(obj_path, funcs if fix_frame else None)
+        if compiled is not None:
+            built[obj_path] = compiled
     return built
 
 
@@ -203,10 +354,11 @@ def check_single(func_name: str, fix_frame: bool, full_diff: bool) -> int:
         print(f"error: could not find function '{func_name}' in report.json", file=sys.stderr)
         return 1
 
-    if not build_unit(obj_path, [func_name] if fix_frame else None):
+    compiled = build_unit(obj_path, [func_name] if fix_frame else None)
+    if compiled is None:
         return 1
 
-    result = run_diff(obj_path, func_name, capture=True)
+    result = run_diff(obj_path, compiled.obj, func_name, capture=True)
     out = result.stdout if full_diff else collapse_matching(result.stdout)
     print(out, end="")
     if result.stderr:
@@ -224,14 +376,15 @@ def check_multiple(func_names: list[str], fix_frame: bool) -> int:
     rc = 0
 
     for obj_path, funcs in func_units.items():
-        if obj_path not in built:
+        compiled = built.get(obj_path)
+        if compiled is None:
             for func_name in funcs:
-                print(f"{func_name}: ERROR (build failed)")
+                print(f"{func_name}: ERROR (compile failed)")
             rc = 1
             continue
 
         for func_name in funcs:
-            result = run_diff(obj_path, func_name, fmt="percent", capture=True)
+            result = run_diff(obj_path, compiled.obj, func_name, fmt="percent", capture=True)
             percent = result.stdout.strip()
             if percent == "100.00":
                 print(f"{func_name}: PASS")

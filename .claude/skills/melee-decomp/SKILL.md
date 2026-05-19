@@ -11,6 +11,16 @@ description: Decompile individual Melee functions. Use whenever you are decompil
 
 If they were not already provided to you, locate the .c and .h files that will contain the decompiled source for this function using `rg <function_name>`. Usually, there will be a `/// #function_name` placeholder comment in the .c file, and a declaration in the .h file. After locating the file, check if you have any Skills relating to it (such as `item-decomp` for item-related functions).
 
+> **Invoking the tooling.** `decomp.py` is a melee-tree tool — run it from the
+> melee checkout (`uv run tools/decomp.py …`). The other scripts
+> (`checkdiff.py`, `stack_permute.py`, `permute.py`, `infer_struct.py`,
+> `mwcc_dump.py`) live in the sibling harness repo and are run **in place**
+> against the melee checkout via `MELEE_ROOT` — there is no symlink/overlay:
+> ```sh
+> MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/<script>.py …
+> ```
+> Set `MELEE_ROOT` to your melee checkout. The examples below show the full form.
+
 Run `decomp.py` to get an initial guess:
 ```sh
 uv run tools/decomp.py --no-copy <function name> --globals=none --no-casts
@@ -22,7 +32,7 @@ Paste the output into the .c file. If there's a `/// #function_name` comment, re
 
 Compile and diff against the original:
 ```sh
-uv run tools/checkdiff.py <function_name>
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py <function_name>
 ```
 
 An empty diff means a perfect match: You're done!
@@ -99,13 +109,13 @@ If you get stuck, look around in the file for functions that contain logic simil
 
 One of the most common sources of mismatches is an incorrect frame size, and/or variables being placed at incorrect stack offsets. `checkdiff.py` will fix trivial stack issues automatically; it does so by running `stack_permute.py --fix-frame`. If the stack issues are more complex, you can try fixing them via brute force, with the stack permuter:
 ```sh
-uv run tools/stack_permute.py <function name> --timeout 10
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/stack_permute.py <function name> --timeout 10
 ```
 This will attempt various permutations of the stack layout until it finds a match, up to a specified timeout. Note that the permuter is very CPU intensive, and should therefore be used judiciously. Only use it for functions that are close to matching, with the remaining differences mostly relating to stack. Also refrain from setting a timeout longer than 30 seconds.
 
 Other minor mismatches (such as regswaps) can sometimes be resolved by randomly permuting function logic. This is facilitated by the more general `permute.py` script:
 ```sh
-uv run tools/permute.py <function name> --timeout 60
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/permute.py <function name> --timeout 60
 ```
 
 This will rapidly test random permutations for up to 60 seconds, then output a diff for the best result. Since the permuter works on preprocessed C, the diff will typically not cleanly apply as-is; you must apply it manually.
@@ -118,7 +128,7 @@ By default, `permute.py` only permutes the specified function. Read its doccomme
 
 Proper types are essential to the decompilation process. For this reason, type-erasing casts (such as `(void*)`, `(u8*)`, or the `M2C_FIELD` macro) are strongly discouraged. Determining these types is often a process of trial and error, but there is a tool, `infer_struct.py`, that can automate the process somewhat. It scans the function's asm, watches every load/store that uses a particular register, and prints a candidate struct definition with offsets, sizes, and types inferred from the instruction mnemonics. It also detects stride hints to suggest the element size of an iterated struct. For example, when decompiling `grKinokoRoute_80207B5C`:
 ```sh
-uv run tools/infer_struct.py grKinokoRoute_80207B5C r29
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/infer_struct.py grKinokoRoute_80207B5C r29
 ```
 Output:
 ```c
