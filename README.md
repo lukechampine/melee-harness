@@ -34,7 +34,7 @@ decomp-permuter/       vendored decomp-permuter fork (setup below)
 | `infer_struct.py` | struct field inference |
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
-| `mwcc_dump.py` | compile a TU with the mwcc_debug compiler → `pcdump.txt` |
+| `mwcc_dump.py` | dump the mwcc_debug compiler's listing for one function → `pcdump.txt` |
 
 ### .claude/hooks/
 
@@ -101,9 +101,12 @@ no `permuter_settings.toml` is needed in the melee checkout.
 
 ## Building the mwcc_debug compiler + patched wibo
 
-`mwcc_dump.py` compiles one melee TU with an instrumented MWCC and writes
-`pcdump.txt` (IR-optimizer decisions + every PPC-backend pass, with symbol
-names and `AFTER REGISTER COLORING` / `FINAL CODE`). The DLL and the patched
+`mwcc_dump.py` takes a **function name**, resolves its TU via
+`build/GALE01/report.json` (the same lookup `checkdiff.py` uses), compiles
+that TU with an instrumented MWCC, then truncates `pcdump.txt` to just that
+function's section (IR-optimizer decisions + every PPC-backend pass, with
+symbol names and `AFTER REGISTER COLORING` / `FINAL CODE`) so the output
+concerns only that function. The DLL and the patched
 wibo are built by `./setup.sh` (above) into `bin/`; both are macOS (Apple
 Silicon, via Rosetta) and vendored as source because the fixes live as
 uncommitted working-tree changes.
@@ -158,8 +161,12 @@ stays in place so the normal melee build is unaffected.
 From the melee checkout, after both builds:
 
 ```sh
-tools/mwcc_dump.py src/melee/it/items/itarwinglaser.c   # -> ./pcdump.txt
+tools/mwcc_dump.py it_802E70BC   # -> ./pcdump.txt, that function only
 ```
+
+The TU is resolved automatically, so you only name the function. If the
+function isn't in `pcdump.txt` (inlined away, or a wrong name), the full
+dump is left in place and the names that *are* present are listed.
 
 Defaults to the patched wibo with an automatic Wine fallback on SIGBUS
 (`--runner wibo` / `--runner wine` to force one).
