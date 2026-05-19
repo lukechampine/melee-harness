@@ -12,9 +12,13 @@ tools/                 custom decomp scripts (overlay onto melee/tools/)
 .claude/
   skills/              Claude Code skills (overlay onto melee/.claude/skills/)
   settings.json        project hooks (see "Hardcoded paths" below)
-  settings.local.json.example   personal permission allowlist — copy to
-                                .claude/settings.local.json per machine
 objdiff/               vendored objdiff-cli fork source (build instructions below)
+mwcc_debug/            mwcc_debug DLL source: patches MWCC v1.2.5n to emit
+                       IR-optimizer + PPC-backend listings to pcdump.txt
+                       (build instructions below)
+wibo/                  vendored wibo fork source:
+                       fixes the formatoperands SIGBUS and the sjiswrap
+                       nested-PE crash (build instructions below)
 ```
 
 ### tools/
@@ -27,11 +31,9 @@ objdiff/               vendored objdiff-cli fork source (build instructions belo
 | `infer_struct.py` | struct field inference |
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
+| `mwcc_dump.py` | compile a TU with the mwcc_debug compiler → `pcdump.txt` |
 | `check_inline_vars.py` | hook: flags inlined-function patterns |
 | `check_type_erasing_casts.py` | hook: flags type-erasing casts |
-
-`generate-db.py` and `build_match_timeline.py` are intentionally **not** vendored
-here.
 
 ### .claude/skills/
 
@@ -43,10 +45,6 @@ here.
 `objdiff/` is a vendored copy of a fork of
 [encounter/objdiff](https://github.com/encounter/objdiff):
 
-- fork remote: `git@github.com:lukechampine/objdiff`
-- branch `unix` @ `04d6290` **plus uncommitted working-tree changes** to
-  `objdiff-cli/src/cmd/diff.rs` (this is why the source is vendored as a copy,
-  not referenced by SHA — the modifications were never pushed)
 - local additions vs upstream: unix-style diffs, percent output, `-f stack`
   and `-f two-column` modes, `d=data` mark
 
@@ -56,10 +54,7 @@ Requirements: Rust **1.88+** (edition 2024). Build and install it locally:
 ./setup.sh
 ```
 
-This runs a release build and installs the binary to `./bin/objdiff-cli`
-(both `objdiff/target/` and `/bin/` are gitignored). `Cargo.lock` is
-committed, so the build is dependency-pinned. Nothing is written to the
-system `PATH` or `~/.cargo/bin`.
+This runs a release build and installs the binary to `./bin/objdiff-cli`.
 
 The tools resolve the binary via `tools/objdiff_path.py`, in this order:
 
@@ -74,14 +69,7 @@ works whether the tools run in place or are symlinked into a melee checkout.
 ## Setting up decomp-permuter
 
 `tools/decomp-permuter/` is a vendored copy of a fork of
-[decomp-permuter](https://github.com/simonlindholm/decomp-permuter):
-
-- fork remote: `https://github.com/jellejurre/decomp-permuter`
-- branch `melee` @ `f3c9261` **plus local working-tree modifications** to
-  `src/` (`ast_util.py`, `candidate.py`, `main.py`, `perm/parse.py`,
-  `permuter.py`, `randomizer.py`, `scorer.py`) and `permuter_settings.toml`
-  (this is why it is vendored as a copy, not referenced by SHA — the
-  modifications were never pushed)
+[decomp-permuter](https://github.com/jellejurre/decomp-permuter):
 
 It uses [`uv`](https://docs.astral.sh/uv/); `uv.lock` is vendored, so:
 
@@ -90,21 +78,74 @@ cd tools/decomp-permuter
 uv sync
 ```
 
-Driven by `permute.py` / `stack_permute.py` from the melee checkout.
+Driven by `permute.py`.
 
-## Known follow-ups (not done yet)
+## Building the mwcc_debug compiler + patched wibo
 
-These are tracked deliberately so the overlay is honest about what isn't
-portable yet:
+`mwcc_dump.py` compiles one melee TU with an instrumented MWCC and writes
+`pcdump.txt` (IR-optimizer decisions + every PPC-backend pass, with symbol
+names and `AFTER REGISTER COLORING` / `FINAL CODE`). Two pieces must be built
+first; both are macOS (Apple Silicon, via Rosetta) and vendored here as
+source because the fixes live as uncommitted working-tree changes.
 
-1. **`tools/project.py` diff.** The melee build-config changes live as a diff
-   against the upstream tracked file and are not captured here; handle as a
-   patch applied during setup.
-2. **Overlay wiring.** Symlink / stow these dirs into the melee checkout and add
-   the paths to `melee/.git/info/exclude` so PRs stay clean.
+### 1. The mwcc_debug DLL + patched compiler
 
-Resolved: the `.claude/settings.json` hooks use `$CLAUDE_PROJECT_DIR` (set by
-Claude Code to the melee checkout root), and the tools resolve a
-harness-local `objdiff-cli` via `tools/objdiff_path.py` (`./setup.sh`
-installs it). No hardcoded paths remain and nothing depends on a
-system-wide `PATH`.
+`mwcc_debug/` builds `MWDBG326.dll`, a replacement for the MWCC v1.2.5n
+license-manager stub that flips on the compiler's dormant `debuglisting`
+output and calls its own `formatoperands` to dump every basic block.
+
+```sh
+cd mwcc_debug
+./build_macos.sh          # downloads a pinned Zig toolchain into tools/,
+                          # emits lmgr326b.dll and MWDBG326.dll
+# Patch a copy of the melee compiler so wibo loads the debug DLL
+# (wibo shims LMGR326B.dll, so the import is renamed to MWDBG326.dll):
+uv run patch_mwcceppc_for_wibo.py \
+    <melee>/build/compilers/GC/1.2.5n/mwcceppc.exe \
+    <melee>/build/compilers/GC/1.2.5n/mwcceppc_debug.exe
+```
+
+This leaves `mwcceppc_debug.exe` + `MWDBG326.dll` in the melee checkout's
+`build/compilers/GC/1.2.5n/`. `mwcc_dump.py` invokes `mwcceppc_debug.exe`;
+keep the unpatched `mwcceppc.exe` so the normal melee build is unaffected.
+
+### 2. The patched wibo
+
+`wibo/` is a vendored copy of a fork of
+[decompals/wibo](https://github.com/decompals/wibo).
+
+- `macros.S`: rewrites the `LJMP64` 32↔64-bit trampoline to build the far
+  return on the stack instead of a shared writable `.data` slot — fixes the
+  deterministic `formatoperands` SIGBUS on `@NNN` scratch temps
+- `loader.cpp`/`main.cpp`/`modules.h`: relocate a nested PE off its
+  preferred image base — fixes the `sjiswrap.exe → mwcceppc.exe` crash
+
+Build it:
+
+```sh
+cd wibo
+env -u VIRTUAL_ENV cmake --preset release-macos \
+    -DPython3_EXECUTABLE="$(brew --prefix)/bin/python3"
+env -u VIRTUAL_ENV cmake --build --preset release-macos
+# -> wibo/build/release/wibo
+```
+
+`mwcc_dump.py` resolves the wibo binary in this order:
+
+1. `$MWCC_WIBO` — explicit override
+2. `<melee>/../melee-harness/wibo/build/release/wibo` — sibling layout (the
+   normal case: the script runs as the melee overlay copy)
+3. `<harness>/wibo/build/release/wibo` — run in place from the harness
+4. `<melee>/build/tools/wibo` — stock fallback (crashes; the script's
+   Wine fallback covers it)
+
+### Usage
+
+From the melee checkout, after both builds:
+
+```sh
+tools/mwcc_dump.py src/melee/it/items/itarwinglaser.c   # -> ./pcdump.txt
+```
+
+Defaults to the patched wibo with an automatic Wine fallback on SIGBUS
+(`--runner wibo` / `--runner wine` to force one).

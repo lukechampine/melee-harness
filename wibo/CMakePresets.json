@@ -1,0 +1,357 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "ninja-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "WIBO_ENABLE_LIBURING": "ON"
+      }
+    },
+    {
+      "name": "gnu-base",
+      "hidden": true,
+      "cacheVariables": {
+        "WIBO_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "clang-base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "Debug build (32-bit Linux)",
+      "inherits": ["ninja-base", "gnu-base"],
+      "binaryDir": "${sourceDir}/build/debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/i686-linux-gcc.cmake"
+      }
+    },
+    {
+      "name": "debug-macos",
+      "displayName": "Debug",
+      "description": "Debug build (64-bit macOS)",
+      "inherits": ["ninja-base"],
+      "binaryDir": "${sourceDir}/build/debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-darwin.cmake"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "Release build (32-bit Linux)",
+      "inherits": ["ninja-base", "gnu-base"],
+      "binaryDir": "${sourceDir}/build/release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/i686-linux-gcc.cmake"
+      }
+    },
+    {
+      "name": "release-macos",
+      "displayName": "Release",
+      "description": "Release build (64-bit macOS)",
+      "inherits": ["ninja-base"],
+      "binaryDir": "${sourceDir}/build/release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-darwin.cmake"
+      }
+    },
+    {
+      "name": "debug-clang",
+      "displayName": "Debug (Clang)",
+      "inherits": ["ninja-base", "clang-base"],
+      "binaryDir": "${sourceDir}/build/debug-clang",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/i686-linux-clang.cmake"
+      }
+    },
+    {
+      "name": "release-clang",
+      "displayName": "Release (Clang)",
+      "inherits": ["ninja-base", "clang-base"],
+      "binaryDir": "${sourceDir}/build/release-clang",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/i686-linux-clang.cmake"
+      }
+    },
+    {
+      "name": "debug64",
+      "displayName": "Debug (64-bit)",
+      "inherits": ["ninja-base", "gnu-base"],
+      "binaryDir": "${sourceDir}/build/debug64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-linux-gcc.cmake"
+      }
+    },
+    {
+      "name": "release64",
+      "displayName": "Release (64-bit)",
+      "inherits": ["ninja-base", "gnu-base"],
+      "binaryDir": "${sourceDir}/build/release64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-linux-gcc.cmake"
+      }
+    },
+    {
+      "name": "debug64-clang",
+      "displayName": "Debug (64-bit, Clang)",
+      "inherits": ["ninja-base", "clang-base"],
+      "binaryDir": "${sourceDir}/build/debug64-clang",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-linux-clang.cmake"
+      }
+    },
+    {
+      "name": "release64-clang",
+      "displayName": "Release (64-bit, Clang)",
+      "inherits": ["ninja-base", "clang-base"],
+      "binaryDir": "${sourceDir}/build/release64-clang",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/x86_64-linux-clang.cmake"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "displayName": "Build (Debug)",
+      "configurePreset": "debug",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Debug"
+    },
+    {
+      "name": "debug-macos",
+      "displayName": "Build (Debug)",
+      "configurePreset": "debug-macos",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "displayName": "Build (Release)",
+      "configurePreset": "release",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Release"
+    },
+    {
+      "name": "release-macos",
+      "displayName": "Build (Release)",
+      "configurePreset": "release-macos",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Release"
+    },
+    {
+      "name": "debug-clang",
+      "displayName": "Build (Debug, Clang)",
+      "configurePreset": "debug-clang",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Debug"
+    },
+    {
+      "name": "release-clang",
+      "displayName": "Build (Release, Clang)",
+      "configurePreset": "release-clang",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Release"
+    },
+    {
+      "name": "debug64",
+      "displayName": "Build (Debug, 64-bit)",
+      "configurePreset": "debug64",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Debug"
+    },
+    {
+      "name": "release64",
+      "displayName": "Build (Release, 64-bit)",
+      "configurePreset": "release64",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Release"
+    },
+    {
+      "name": "debug64-clang",
+      "displayName": "Build (Debug, 64-bit, Clang)",
+      "configurePreset": "debug64-clang",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Debug"
+    },
+    {
+      "name": "release64-clang",
+      "displayName": "Build (Release, 64-bit, Clang)",
+      "configurePreset": "release64-clang",
+      "targets": ["wibo", "wibo_test_fixtures"],
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "displayName": "Run tests (Debug)",
+      "configurePreset": "debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "debug-macos",
+      "displayName": "Run tests (Debug)",
+      "configurePreset": "debug-macos",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Run tests (Release)",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "release-macos",
+      "displayName": "Run tests (Release)",
+      "configurePreset": "release-macos",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "debug-clang",
+      "displayName": "Run tests (Debug, Clang)",
+      "configurePreset": "debug-clang",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "release-clang",
+      "displayName": "Run tests (Release, Clang)",
+      "configurePreset": "release-clang",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "debug64",
+      "displayName": "Run tests (Debug, 64-bit)",
+      "configurePreset": "debug64",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "release64",
+      "displayName": "Run tests (Release, 64-bit)",
+      "configurePreset": "release64",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "debug64-clang",
+      "displayName": "Run tests (Debug, 64-bit, Clang)",
+      "configurePreset": "debug64-clang",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    },
+    {
+      "name": "release64-clang",
+      "displayName": "Run tests (Release, 64-bit, Clang)",
+      "configurePreset": "release64-clang",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true,
+        "shortProgress": true
+      }
+    }
+  ]
+}

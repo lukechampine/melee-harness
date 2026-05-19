@@ -1,0 +1,11 @@
+/tools/zig-*/
+/tools/*.tar.xz
+/tools/zig-index.json
+/zig-index.json
+/build-test.o
+/*.dll
+/*.exp
+/*.lib
+/smoke/
+/pcdump.txt
+__pycache__/

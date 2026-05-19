@@ -1,0 +1,541 @@
+cmake_minimum_required(VERSION 3.13)
+
+project(wibo LANGUAGES ASM C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+
+set(WIBO_VERSION "" CACHE STRING "Version string for the wibo binary; if empty, attempts to use git describe")
+
+if(NOT "${WIBO_VERSION}" STREQUAL "")
+    set(WIBO_VERSION_STRING "${WIBO_VERSION}")
+elseif(DEFINED ENV{WIBO_VERSION} AND NOT "$ENV{WIBO_VERSION}" STREQUAL "")
+    set(WIBO_VERSION_STRING "$ENV{WIBO_VERSION}")
+else()
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} describe --tags --dirty --always
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            RESULT_VARIABLE WIBO_GIT_DESCRIBE_RESULT
+            OUTPUT_VARIABLE WIBO_GIT_DESCRIBE_OUTPUT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(WIBO_GIT_DESCRIBE_RESULT EQUAL 0 AND NOT "${WIBO_GIT_DESCRIBE_OUTPUT}" STREQUAL "")
+            set(WIBO_VERSION_STRING "${WIBO_GIT_DESCRIBE_OUTPUT}")
+        endif()
+    endif()
+endif()
+
+if(NOT DEFINED WIBO_VERSION_STRING OR "${WIBO_VERSION_STRING}" STREQUAL "")
+    set(WIBO_VERSION_STRING "unknown")
+endif()
+
+set(WIBO_GENERATED_HEADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${WIBO_GENERATED_HEADER_DIR})
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/version_info.h.in
+    ${WIBO_GENERATED_HEADER_DIR}/version_info.h
+    @ONLY
+)
+
+# Detect if we're building for 64-bit based on the target architecture
+# CMAKE_SIZEOF_VOID_P is set by the project() command and the toolchain
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(WIBO_64 ON)
+    message(STATUS "Detected 64-bit target architecture")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(WIBO_64 OFF)
+    message(STATUS "Detected 32-bit target architecture")
+else()
+    message(FATAL_ERROR "Unknown pointer size: ${CMAKE_SIZEOF_VOID_P}")
+endif()
+
+option(WIBO_ENABLE_FIXTURE_TESTS "Enable Win32 fixture tests (requires i686-w64-mingw32)" ON)
+option(WIBO_ENABLE_LIBURING "Enable liburing for asynchronous I/O" OFF)
+option(WIBO_ENABLE_WINE_DLLS "Download Wine CRT DLLs from encounter/winedll by default" ON)
+set(WIBO_ENABLE_LTO "AUTO" CACHE STRING "Enable link-time optimization (LTO)")
+set_property(CACHE WIBO_ENABLE_LTO PROPERTY STRINGS "AUTO" "ON" "OFF")
+
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+)
+
+if (WIBO_ENABLE_LTO STREQUAL "AUTO")
+    if (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+        if (ipo_supported)
+            message(STATUS "Enabling LTO")
+            set(WIBO_ENABLE_LTO ON)
+        else()
+            message(STATUS "LTO not supported: ${ipo_error}")
+            set(WIBO_ENABLE_LTO OFF)
+        endif()
+    else()
+        message(STATUS "Disabling LTO")
+        set(WIBO_ENABLE_LTO OFF)
+    endif()
+elseif (NOT (WIBO_ENABLE_LTO STREQUAL "ON" OR WIBO_ENABLE_LTO STREQUAL "OFF"))
+    message(FATAL_ERROR "WIBO_ENABLE_LTO must be ON, OFF, or AUTO")
+endif()
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ${WIBO_ENABLE_LTO})
+
+# Fetch and configure mimalloc
+set(MI_BUILD_SHARED OFF CACHE BOOL "Build shared library" FORCE)
+set(MI_BUILD_STATIC OFF CACHE BOOL "Build static library" FORCE)
+set(MI_BUILD_OBJECT ON CACHE BOOL "Build object library" FORCE)
+set(MI_BUILD_TESTS OFF CACHE BOOL "Build test executables" FORCE)
+
+include(FetchContent)
+FetchContent_Declare(
+    mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG        69c5c5c402bf0414ff4a366697ecbd5c7578dc02  # dev3 (2025-11-05)
+)
+FetchContent_MakeAvailable(mimalloc)
+
+# Disable `note: the alignment of '_Atomic long long int' fields changed in GCC 11.1`
+target_compile_options(mimalloc-obj PRIVATE -Wno-psabi)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(mimalloc-obj PRIVATE MI_USE_BUILTIN_THREAD_POINTER=1)
+endif()
+if (WIBO_64)
+    # Disable a noisy warning on startup
+    target_compile_definitions(mimalloc-obj PRIVATE MI_DEBUG=0)
+endif()
+
+if (WIBO_ENABLE_LIBURING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    FetchContent_Declare(
+        liburing
+        GIT_REPOSITORY https://github.com/axboe/liburing.git
+        GIT_TAG        e907d6a342e80b70874f93abd440b92b8a40b7bc  # liburing-2.12
+    )
+    FetchContent_MakeAvailable(liburing)
+
+    add_custom_command(
+        OUTPUT  ${liburing_SOURCE_DIR}/config-host.h
+                ${liburing_SOURCE_DIR}/src/include/liburing/compat.h
+        COMMAND ${CMAKE_COMMAND} -E env
+                CC=${CMAKE_C_COMPILER}
+                CXX=${CMAKE_CXX_COMPILER}
+                ./configure --prefix=${liburing_BINARY_DIR}
+        WORKING_DIRECTORY ${liburing_SOURCE_DIR}
+        DEPENDS ${liburing_SOURCE_DIR}/configure
+        COMMENT "Running liburing configure"
+        VERBATIM
+    )
+    add_library(liburing STATIC
+        ${liburing_SOURCE_DIR}/config-host.h
+        ${liburing_SOURCE_DIR}/src/nolibc.c
+        ${liburing_SOURCE_DIR}/src/queue.c
+        ${liburing_SOURCE_DIR}/src/register.c
+        ${liburing_SOURCE_DIR}/src/setup.c
+        ${liburing_SOURCE_DIR}/src/syscall.c
+        ${liburing_SOURCE_DIR}/src/version.c
+        ${liburing_SOURCE_DIR}/src/include/liburing/compat.h)
+    target_compile_definitions(liburing PRIVATE _GNU_SOURCE _FILE_OFFSET_BITS=64 _TIME_BITS=64)
+    target_compile_options(liburing PRIVATE -include config-host.h)
+    target_include_directories(liburing PUBLIC ${liburing_SOURCE_DIR}/src/include)
+    target_include_directories(liburing PRIVATE ${liburing_SOURCE_DIR})
+endif()
+
+set(WIBO_WINEDLL_RELEASE_TAG "2026-03-04")
+
+function(configure_wine_dll VAR FILENAME SHA256)
+    if (NOT DEFINED ${VAR})
+        if (WIBO_ENABLE_WINE_DLLS)
+            file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/vendor)
+            set(${VAR} ${CMAKE_CURRENT_BINARY_DIR}/vendor/${FILENAME})
+            file(DOWNLOAD
+                https://github.com/encounter/winedll/releases/download/${WIBO_WINEDLL_RELEASE_TAG}/${FILENAME}
+                ${${VAR}}
+                EXPECTED_HASH SHA256=${SHA256}
+            )
+        else()
+            set(${VAR} "")
+        endif()
+    endif()
+    set(${VAR} "${${VAR}}" PARENT_SCOPE)
+endfunction()
+
+configure_wine_dll(MSVCRT_DLL msvcrt.dll 1d44b9d04133629fa76057b7235ba4fb288204c0da447e4e1624d66251cd611d)
+configure_wine_dll(MSVCR71_DLL msvcr71.dll da554a689d54b3047f163aca817bf934ca292458d1158b0dcbeeafb531512f13)
+configure_wine_dll(MSVCR90_DLL msvcr90.dll 01524a7a8b8982ab20f7296630f1f504e317b776c019897634e20d4216890c1b)
+configure_wine_dll(MSVCR100_DLL msvcr100.dll 559adc19f18c241cfdbd79c241c1247d1457478230f64159d63535aed730d0c4)
+configure_wine_dll(MSVCR120_DLL msvcr120.dll 38e47d62582a7bcf7e90b75dbe0c4219e2dde11e228865ff2c1a4defd737c113)
+configure_wine_dll(UCRTBASE_DLL ucrtbase.dll 7321cfb3df9846d11ab7533d0d2ef8aa9e61a6a81a68e48362739fd675e14c5b)
+
+function(embed_binary SRC FILE)
+    set_source_files_properties(${SRC} PROPERTIES
+        OBJECT_DEPENDS "${FILE}"
+        COMPILE_DEFINITIONS "EMBED_PATH=\"${FILE}\""
+    )
+endfunction()
+
+function(add_embedded_wine_dll TARGET SRC FLAG FILE)
+    if ("${FILE}" STREQUAL "")
+        target_compile_definitions(${TARGET} PRIVATE ${FLAG}=0)
+    else()
+        target_compile_definitions(${TARGET} PRIVATE ${FLAG}=1)
+        target_sources(${TARGET} PRIVATE ${SRC})
+        embed_binary(${SRC} "${FILE}")
+    endif()
+endfunction()
+
+add_executable(wibo
+    dll/advapi32.cpp
+    dll/advapi32/md5.c
+    dll/advapi32/processthreadsapi.cpp
+    dll/advapi32/securitybaseapi.cpp
+    dll/advapi32/winbase.cpp
+    dll/advapi32/wincrypt.cpp
+    dll/advapi32/winreg.cpp
+    dll/bcrypt.cpp
+    dll/kernel32.cpp
+    dll/kernel32/debugapi.cpp
+    dll/kernel32/errhandlingapi.cpp
+    dll/kernel32/fibersapi.cpp
+    dll/kernel32/fileapi.cpp
+    dll/kernel32/handleapi.cpp
+    dll/kernel32/heapapi.cpp
+    dll/kernel32/interlockedapi.cpp
+    dll/kernel32/ioapiset.cpp
+    dll/kernel32/libloaderapi.cpp
+    dll/kernel32/memoryapi.cpp
+    dll/kernel32/namedpipeapi.cpp
+    dll/kernel32/processenv.cpp
+    dll/kernel32/processthreadsapi.cpp
+    dll/kernel32/profileapi.cpp
+    dll/kernel32/stringapiset.cpp
+    dll/kernel32/synchapi.cpp
+    dll/kernel32/sysinfoapi.cpp
+    dll/kernel32/timezoneapi.cpp
+    dll/kernel32/winbase.cpp
+    dll/kernel32/wincon.cpp
+    dll/kernel32/winnls.cpp
+    dll/kernel32/winnt.cpp
+    dll/kernel32/wow64apiset.cpp
+    dll/lmgr.cpp
+    dll/mscoree.cpp
+    dll/ntdll.cpp
+    dll/ole32.cpp
+    dll/rpcrt4.cpp
+    dll/user32.cpp
+    dll/vcruntime.cpp
+    dll/version.cpp
+    dll/ws2.cpp
+    src/access.cpp
+    src/async_io.cpp
+    src/errors.cpp
+    src/files.cpp
+    src/handles.cpp
+    src/heap.cpp
+    src/loader.cpp
+    src/main.cpp
+    src/modules.cpp
+    src/processes_common.cpp
+    src/resources.cpp
+    src/setup.S
+    src/strutil.cpp
+    src/tls.cpp
+)
+add_embedded_wine_dll(wibo dll/msvcrt.cpp WIBO_HAS_MSVCRT "${MSVCRT_DLL}")
+add_embedded_wine_dll(wibo dll/msvcr71.cpp WIBO_HAS_MSVCR71 "${MSVCR71_DLL}")
+add_embedded_wine_dll(wibo dll/msvcr90.cpp WIBO_HAS_MSVCR90 "${MSVCR90_DLL}")
+add_embedded_wine_dll(wibo dll/msvcr100.cpp WIBO_HAS_MSVCR100 "${MSVCR100_DLL}")
+add_embedded_wine_dll(wibo dll/msvcr120.cpp WIBO_HAS_MSVCR120 "${MSVCR120_DLL}")
+add_embedded_wine_dll(wibo dll/ucrtbase.cpp WIBO_HAS_UCRTBASE "${UCRTBASE_DLL}")
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(wibo PRIVATE
+        src/async_io_epoll.cpp
+        src/processes_linux.cpp
+        src/setup_linux.cpp
+    )
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_sources(wibo PRIVATE
+        src/async_io_kqueue.cpp
+        src/processes_darwin.cpp
+        src/setup_darwin.cpp
+    )
+    set_source_files_properties(src/setup_darwin.cpp PROPERTIES COMPILE_FLAGS "-fms-extensions")
+else()
+    message(FATAL_ERROR "Unsupported platform for ProcessManager")
+endif()
+target_compile_definitions(wibo PRIVATE _GNU_SOURCE _FILE_OFFSET_BITS=64 _TIME_BITS=64)
+target_compile_features(wibo PRIVATE cxx_std_20)
+target_compile_options(wibo PRIVATE -Wall -Wextra)
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_link_options(wibo PRIVATE
+        -Wl,-no_pie,-no_fixup_chains
+        -Wl,-segalign,0x1000
+        -Wl,-pagezero_size,0x1000
+        -Wl,-image_base,0x7E001000
+        -Wl,-segaddr,RESV32,0x1000
+        -Wl,-segprot,RESV32,-,-
+    )
+else()
+    target_link_options(wibo PRIVATE -no-pie -Wl,--image-base=0x70000000)
+endif()
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(wibo PRIVATE -maccumulate-outgoing-args)
+    target_link_options(wibo PRIVATE -maccumulate-outgoing-args)
+endif()
+target_include_directories(wibo PRIVATE dll src ${WIBO_GENERATED_HEADER_DIR})
+target_link_libraries(wibo PRIVATE mimalloc-obj)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(wibo PRIVATE atomic)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_link_libraries(wibo PRIVATE c++ c++abi)
+endif()
+if (WIBO_ENABLE_LIBURING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(wibo PRIVATE WIBO_ENABLE_LIBURING=1)
+    target_link_libraries(wibo PRIVATE liburing)
+    target_sources(wibo PRIVATE src/async_io_uring.cpp)
+else()
+    target_compile_definitions(wibo PRIVATE WIBO_ENABLE_LIBURING=0)
+endif()
+install(TARGETS wibo DESTINATION bin)
+
+# Check for features
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+set(CMAKE_REQUIRED_LIBRARIES pthread)
+check_symbol_exists(pthread_gettid_np "pthread.h" HAVE_PTHREAD_GETTID_NP)
+if (HAVE_PTHREAD_GETTID_NP)
+    target_compile_definitions(wibo PRIVATE -DHAVE_PTHREAD_GETTID_NP=1)
+endif()
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+# Track down libclang for trampoline generation.
+# find_package(Clang) ends up requiring too many dependencies,
+# so a quick-and-dirty manual search is done here instead.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CLANG_ROOT "/usr" CACHE PATH "Path to Clang installation")
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(CLANG_ROOT "/Library/Developer/CommandLineTools/usr/lib" CACHE PATH "Path to Clang installation")
+endif()
+set(_LLVM_MIN_VER 17)
+set(_LLVM_MAX_VER 25)
+set(_CLANG_LIB_SUFFIXES "")
+foreach(ver RANGE ${_LLVM_MAX_VER} ${_LLVM_MIN_VER} -1)
+    list(APPEND _CLANG_LIB_SUFFIXES "llvm-${ver}/lib")
+endforeach()
+list(APPEND _CLANG_LIB_SUFFIXES llvm/lib lib lib64)
+find_library(LIBCLANG_LIBRARY
+    NAMES libclang clang
+    HINTS ${CLANG_ROOT}
+    PATH_SUFFIXES ${_CLANG_LIB_SUFFIXES}
+)
+if(NOT LIBCLANG_LIBRARY)
+    message(FATAL_ERROR "libclang library not found!")
+endif()
+message(STATUS "Using libclang library: ${LIBCLANG_LIBRARY}")
+
+function(wibo_codegen_module)
+    set(options)
+    set(oneValueArgs NAME)
+    set(multiValueArgs HEADERS)
+    cmake_parse_arguments(PARSE_ARGV 0 module "${options}" "${oneValueArgs}" "${multiValueArgs}")
+
+    set(out_asm ${WIBO_GENERATED_HEADER_DIR}/${module_NAME}_trampolines.S)
+    set(out_hdr ${WIBO_GENERATED_HEADER_DIR}/${module_NAME}_trampolines.h)
+    add_custom_command(
+        OUTPUT ${out_asm} ${out_hdr}
+        COMMAND ${CMAKE_COMMAND} -E env
+                ${CMAKE_COMMAND} -E echo "Generating ${module_NAME} trampolines"
+        COMMAND ${CMAKE_COMMAND} -E env
+                LIBCLANG_PATH=${LIBCLANG_LIBRARY}
+                ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_trampolines.py
+                --dll ${module_NAME}
+                --headers ${module_HEADERS}
+                --namespace ${module_NAME}
+                --arch $<IF:$<BOOL:${WIBO_64}>,x86_64,x86>
+                --out-asm ${out_asm}
+                --out-hdr ${out_hdr}
+                -I ${CMAKE_CURRENT_SOURCE_DIR}
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/dll
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/src
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_trampolines.py
+                ${module_HEADERS}
+    )
+    target_sources(wibo PRIVATE ${out_asm})
+endfunction()
+
+wibo_codegen_module(NAME advapi32 HEADERS
+    dll/advapi32/processthreadsapi.h
+    dll/advapi32/securitybaseapi.h
+    dll/advapi32/winbase.h
+    dll/advapi32/wincrypt.h
+    dll/advapi32/winreg.h
+)
+wibo_codegen_module(NAME bcrypt HEADERS dll/bcrypt.h)
+wibo_codegen_module(NAME entry HEADERS src/entry.h)
+wibo_codegen_module(NAME mscoree HEADERS dll/mscoree.h)
+wibo_codegen_module(NAME version HEADERS dll/version.h)
+wibo_codegen_module(NAME rpcrt4 HEADERS dll/rpcrt4.h)
+wibo_codegen_module(NAME vcruntime HEADERS dll/vcruntime.h)
+wibo_codegen_module(NAME lmgr HEADERS dll/lmgr.h)
+wibo_codegen_module(NAME ole32 HEADERS dll/ole32.h)
+wibo_codegen_module(NAME user32 HEADERS dll/user32.h)
+wibo_codegen_module(NAME ntdll HEADERS dll/ntdll.h)
+wibo_codegen_module(NAME kernel32 HEADERS
+    dll/kernel32/debugapi.h
+    dll/kernel32/errhandlingapi.h
+    dll/kernel32/fibersapi.h
+    dll/kernel32/fileapi.h
+    dll/kernel32/handleapi.h
+    dll/kernel32/heapapi.h
+    dll/kernel32/interlockedapi.h
+    dll/kernel32/ioapiset.h
+    dll/kernel32/libloaderapi.h
+    dll/kernel32/memoryapi.h
+    dll/kernel32/namedpipeapi.h
+    dll/kernel32/processenv.h
+    dll/kernel32/processthreadsapi.h
+    dll/kernel32/profileapi.h
+    dll/kernel32/stringapiset.h
+    dll/kernel32/synchapi.h
+    dll/kernel32/sysinfoapi.h
+    dll/kernel32/timezoneapi.h
+    dll/kernel32/winbase.h
+    dll/kernel32/wincon.h
+    dll/kernel32/winnls.h
+    dll/kernel32/winnt.h
+    dll/kernel32/wow64apiset.h
+)
+
+if (WIBO_ENABLE_FIXTURE_TESTS)
+    include(CTest)
+
+    find_program(WIBO_MINGW_CC i686-w64-mingw32-gcc)
+    find_program(WIBO_MINGW_WINDRES i686-w64-mingw32-windres)
+
+    set(WIBO_HAVE_MINGW_TOOLCHAIN FALSE)
+    if(WIBO_MINGW_CC AND WIBO_MINGW_WINDRES)
+        set(WIBO_HAVE_MINGW_TOOLCHAIN TRUE)
+    endif()
+
+    if(NOT WIBO_HAVE_MINGW_TOOLCHAIN)
+        message(WARNING "MinGW toolchain not found; skipping fixture tests")
+    else()
+        set(WIBO_TEST_BIN_DIR ${CMAKE_CURRENT_BINARY_DIR}/test)
+        file(MAKE_DIRECTORY ${WIBO_TEST_BIN_DIR})
+
+        function(wibo_add_fixture_dll)
+            set(options)
+            set(oneValueArgs NAME)
+            set(multiValueArgs SOURCES COMPILE_OPTIONS DEPENDS)
+            cmake_parse_arguments(PARSE_ARGV 0 fixture "${options}" "${oneValueArgs}" "${multiValueArgs}")
+
+            set(fixture_OUTPUT ${WIBO_TEST_BIN_DIR}/${fixture_NAME}.dll)
+            add_custom_command(
+                OUTPUT ${fixture_OUTPUT}
+                COMMAND ${WIBO_MINGW_CC} -Wall -Wextra -O2 -shared
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/test
+                        -o ${fixture_OUTPUT}
+                        ${fixture_SOURCES}
+                        ${fixture_COMPILE_OPTIONS}
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                DEPENDS ${fixture_SOURCES} ${fixture_DEPENDS})
+            list(APPEND WIBO_TEST_FIXTURES ${fixture_OUTPUT})
+            set(WIBO_TEST_FIXTURES ${WIBO_TEST_FIXTURES} PARENT_SCOPE)
+        endfunction(wibo_add_fixture_dll)
+
+        function(wibo_add_fixture_bin)
+            set(options)
+            set(oneValueArgs NAME)
+            set(multiValueArgs SOURCES COMPILE_OPTIONS DEPENDS)
+            cmake_parse_arguments(PARSE_ARGV 0 fixture "${options}" "${oneValueArgs}" "${multiValueArgs}")
+
+            set(fixture_OUTPUT ${WIBO_TEST_BIN_DIR}/${fixture_NAME}.exe)
+            add_custom_command(
+                OUTPUT ${fixture_OUTPUT}
+                COMMAND ${WIBO_MINGW_CC} -Wall -Wextra -O2
+                        -I${CMAKE_CURRENT_SOURCE_DIR}/test
+                        -o ${fixture_OUTPUT}
+                        ${fixture_SOURCES}
+                        ${fixture_COMPILE_OPTIONS}
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                DEPENDS ${fixture_SOURCES} ${fixture_DEPENDS})
+            list(APPEND WIBO_TEST_FIXTURES ${fixture_OUTPUT})
+            set(WIBO_TEST_FIXTURES ${WIBO_TEST_FIXTURES} PARENT_SCOPE)
+
+            add_test(NAME wibo.${fixture_NAME}
+                COMMAND $<TARGET_FILE:wibo> ${fixture_OUTPUT})
+            set_tests_properties(wibo.${fixture_NAME} PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test
+                DEPENDS wibo.build_fixtures)
+        endfunction(wibo_add_fixture_bin)
+
+        # Define fixture tests
+        wibo_add_fixture_bin(NAME test_external_dll SOURCES test/test_external_dll.c)
+        wibo_add_fixture_bin(NAME test_dll_attach_failure SOURCES test/test_dll_attach_failure.c)
+        wibo_add_fixture_bin(NAME test_thread_notifications SOURCES test/test_thread_notifications.c)
+        wibo_add_fixture_bin(NAME test_bcrypt SOURCES test/test_bcrypt.c COMPILE_OPTIONS -lbcrypt)
+        wibo_add_fixture_bin(NAME test_resources SOURCES test/test_resources.c ${WIBO_TEST_BIN_DIR}/test_resources_res.o COMPILE_OPTIONS -lversion)
+        wibo_add_fixture_bin(NAME test_threading SOURCES test/test_threading.c)
+        wibo_add_fixture_bin(NAME test_tls SOURCES test/test_tls.c)
+        wibo_add_fixture_bin(NAME test_tls_reloc SOURCES test/test_tls_reloc.c)
+        wibo_add_fixture_bin(NAME test_handleapi SOURCES test/test_handleapi.c)
+        wibo_add_fixture_bin(NAME test_findfile SOURCES test/test_findfile.c)
+        wibo_add_fixture_bin(NAME test_getfileattributesex SOURCES test/test_getfileattributesex.c)
+        wibo_add_fixture_bin(NAME test_locale SOURCES test/test_locale.c)
+        wibo_add_fixture_bin(NAME test_critical_section SOURCES test/test_critical_section.c)
+        wibo_add_fixture_bin(NAME test_synchapi SOURCES test/test_synchapi.c)
+        wibo_add_fixture_bin(NAME test_processes SOURCES test/test_processes.c)
+        wibo_add_fixture_bin(NAME test_heap SOURCES test/test_heap.c)
+        wibo_add_fixture_bin(NAME test_actctx SOURCES test/test_actctx.c)
+        wibo_add_fixture_bin(NAME test_overlapped_io SOURCES test/test_overlapped_io.c)
+        wibo_add_fixture_bin(NAME test_time SOURCES test/test_time.c)
+        wibo_add_fixture_bin(NAME test_ntdll_time SOURCES test/test_ntdll_time.c)
+        wibo_add_fixture_bin(NAME test_virtualalloc SOURCES test/test_virtualalloc.c)
+        wibo_add_fixture_bin(NAME test_virtualquery SOURCES test/test_virtualquery.c)
+        wibo_add_fixture_bin(NAME test_clsids SOURCES test/test_clsids.c COMPILE_OPTIONS -lole32)
+        wibo_add_fixture_bin(NAME test_rtl SOURCES test/test_rtl.c)
+        wibo_add_fixture_bin(NAME test_rtl_bitmap SOURCES test/test_rtl_bitmap.c)
+        wibo_add_fixture_bin(NAME test_ntquery SOURCES test/test_ntquery.c)
+        wibo_add_fixture_bin(NAME test_ntqueryfile SOURCES test/test_ntqueryfile.c)
+        wibo_add_fixture_bin(NAME test_ntreadfile SOURCES test/test_ntreadfile.c)
+        wibo_add_fixture_bin(NAME test_ntwritefile SOURCES test/test_ntwritefile.c)
+        wibo_add_fixture_bin(NAME test_pipe_io SOURCES test/test_pipe_io.c)
+        wibo_add_fixture_bin(NAME test_namedpipe SOURCES test/test_namedpipe.c)
+        wibo_add_fixture_bin(NAME test_sysdir SOURCES test/test_sysdir.c)
+        wibo_add_fixture_bin(NAME test_srw_lock SOURCES test/test_srw_lock.c)
+        wibo_add_fixture_bin(NAME test_init_once SOURCES test/test_init_once.c)
+        wibo_add_fixture_bin(NAME test_wait_on_address SOURCES test/test_wait_on_address.c COMPILE_OPTIONS -lsynchronization)
+
+        # DLLs for fixture tests
+        wibo_add_fixture_dll(NAME external_exports SOURCES test/external_exports.c)
+        wibo_add_fixture_dll(NAME dll_attach_failure SOURCES test/dll_attach_failure.c)
+        wibo_add_fixture_dll(NAME thread_notifications SOURCES test/thread_notifications.c)
+        wibo_add_fixture_dll(NAME tls_reloc SOURCES test/tls_reloc_dll.c)
+
+        # Resources for test_resources
+        add_custom_command(
+            OUTPUT ${WIBO_TEST_BIN_DIR}/test_resources_res.o
+            COMMAND ${WIBO_MINGW_WINDRES}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_resources.rc
+                    -O coff -o test_resources_res.o
+            WORKING_DIRECTORY ${WIBO_TEST_BIN_DIR}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_resources.rc)
+
+        add_custom_target(wibo_test_fixtures DEPENDS ${WIBO_TEST_FIXTURES})
+
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_wibo_fixture_build_command
+                ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --config $<CONFIG> --target wibo_test_fixtures)
+        else()
+            set(_wibo_fixture_build_command
+                ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target wibo_test_fixtures)
+        endif()
+
+        add_test(NAME wibo.build_fixtures COMMAND ${_wibo_fixture_build_command})
+    endif()
+endif()
+
+if (NOT TARGET wibo_test_fixtures)
+    add_custom_target(wibo_test_fixtures)
+endif()

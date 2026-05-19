@@ -1,0 +1,64 @@
+# Build stage
+FROM ubuntu:24.04 AS build
+
+# Install dependencies
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        binutils-mingw-w64-i686 \
+        ca-certificates \
+        clang \
+        cmake \
+        file \
+        gcc-mingw-w64-i686 \
+        gdb \
+        git \
+        lib32gcc-13-dev \
+        lib32stdc++-13-dev \
+        libc6-dev-i386 \
+        libclang-dev \
+        linux-libc-dev-i386-cross \
+        lld \
+        llvm \
+        make \
+        ninja-build \
+        python3 \
+        python3-pip \
+        python3-venv \
+        unzip \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source files
+WORKDIR /wibo
+COPY . /wibo
+
+# Build type (release, debug, release64, debug64)
+ARG BUILD_TYPE=release
+
+# Enable link-time optimization (LTO) (AUTO, ON, OFF)
+ARG ENABLE_LTO=AUTO
+
+# Version string (if not provided, defaults to "unknown")
+ARG WIBO_VERSION
+
+# Build dynamic binary
+RUN PRESET=${BUILD_TYPE}-clang; \
+    echo "Building with preset $PRESET" \
+    && cmake -S /wibo -B /wibo/build --preset "$PRESET" \
+        -DCMAKE_AR:PATH=/usr/bin/llvm-ar \
+        -DCMAKE_RANLIB:PATH=/usr/bin/llvm-ranlib \
+        -DWIBO_ENABLE_LTO:STRING="$ENABLE_LTO" \
+        -DWIBO_VERSION:STRING="$WIBO_VERSION" \
+    && LIBCLANG_PATH=/usr/lib/llvm-18/lib cmake --build /wibo/build --verbose \
+    && ( [ "$BUILD_TYPE" != "release"* ] || strip -g /wibo/build/wibo )
+
+# Export binary (usage: docker build -f Dockerfile.ubuntu --target export --output dist .)
+FROM scratch AS export
+COPY --from=build /wibo/build/wibo .
+
+# Runnable container
+FROM ubuntu:24.04
+COPY --from=build /wibo/build/wibo /usr/local/bin/wibo
+CMD ["/usr/local/bin/wibo"]

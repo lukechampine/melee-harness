@@ -1,0 +1,225 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "*.md"
+      - "LICENSE"
+  pull_request:
+
+env:
+  DOCKER_BUILD_CHECKS_ANNOTATIONS: false
+  DOCKER_BUILD_SUMMARY: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.display }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: ubuntu-debug
+            display: Debug (32-bit)
+            dockerfile: Dockerfile.ubuntu
+            build_type: debug
+            default: false
+            suffix: -ubuntu-debug
+          - id: ubuntu-release
+            display: Release (32-bit)
+            dockerfile: Dockerfile.ubuntu
+            build_type: release
+            default: false
+            suffix: -ubuntu
+          - id: ubuntu-debug64
+            display: Debug (64-bit)
+            dockerfile: Dockerfile.ubuntu
+            build_type: debug64
+            default: false
+            suffix: 64-ubuntu-debug
+          - id: ubuntu-release64
+            display: Release (64-bit)
+            dockerfile: Dockerfile.ubuntu
+            build_type: release64
+            default: false
+            suffix: 64-ubuntu
+          - id: static-debug
+            display: Debug (Static, 32-bit)
+            dockerfile: Dockerfile
+            build_type: debug
+            platform: linux/386
+            default: false
+            suffix: -alpine-debug
+          - id: static-release
+            display: Release (Static, 32-bit)
+            dockerfile: Dockerfile
+            build_type: release
+            platform: linux/386
+            default: true
+            suffix: -alpine
+          - id: static-debug64
+            display: Debug (Static, 64-bit)
+            dockerfile: Dockerfile
+            build_type: debug
+            default: false
+            suffix: 64-alpine-debug
+          - id: static-release64
+            display: Release (Static, 64-bit)
+            dockerfile: Dockerfile
+            build_type: release
+            default: false
+            suffix: 64-alpine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/decompals/wibo
+          tags: |
+            type=raw,value=latest,enable=${{ matrix.default && github.ref_type == 'tag' }}
+            type=raw,value=latest${{ matrix.suffix }},enable=${{ github.ref_type == 'tag' }}
+            type=ref,event=tag,enable=${{ matrix.default }}
+            type=ref,event=tag,suffix=${{ matrix.suffix }}
+            type=ref,event=branch,enable=${{ matrix.default }}
+            type=ref,event=branch,suffix=${{ matrix.suffix }}
+            type=sha,enable=${{ matrix.default }}
+            type=sha,suffix=${{ matrix.suffix }}
+          flavor: |
+            latest=false
+
+      - name: Compute version
+        id: version
+        run: echo "wibo_version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            BUILD_TYPE=${{ matrix.build_type }}
+            WIBO_VERSION=${{ steps.version.outputs.wibo_version }}
+          target: build
+          platforms: ${{ matrix.platform || 'linux/amd64' }}
+
+      - name: Tests
+        run: >
+          docker run --rm ${{ steps.docker-build.outputs.imageid }}
+          ctest --test-dir /wibo/build --output-on-failure
+
+      - name: Export binary
+        uses: docker/build-push-action@v6
+        with:
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            BUILD_TYPE=${{ matrix.build_type }}
+            WIBO_VERSION=${{ steps.version.outputs.wibo_version }}
+          target: export
+          outputs: |
+            type=local,dest=dist
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image
+        if: github.event_name != 'pull_request' && github.repository == 'decompals/wibo'
+        uses: docker/build-push-action@v6
+        with:
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            BUILD_TYPE=${{ matrix.build_type }}
+            WIBO_VERSION=${{ steps.version.outputs.wibo_version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.id }}
+          path: dist/wibo
+
+  build-macos:
+    name: Build macOS ${{ matrix.display }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-debug
+            os: macos-latest
+            display: Debug
+            preset: debug-macos
+            build_dir: debug
+          - id: macos-release
+            os: macos-latest
+            display: Release
+            preset: release-macos
+            build_dir: release
+          # For testing only
+          - os: macos-15-intel
+            display: Release (Intel)
+            preset: release-macos
+    steps:
+      - name: Install dependencies
+        run: |
+          brew install mingw-w64
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Build wibo
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Tests
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        if: ${{ matrix.id }}
+        with:
+          name: ${{ matrix.id }}
+          path: build/${{ matrix.build_dir }}/wibo
+
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Prepare artifacts
+        run: |
+          mkdir artifacts/out
+          mv artifacts/static-release/wibo artifacts/out/wibo-i686
+          mv artifacts/static-debug/wibo artifacts/out/wibo-i686-debug
+          mv artifacts/static-release64/wibo artifacts/out/wibo-x86_64
+          mv artifacts/static-debug64/wibo artifacts/out/wibo-x86_64-debug
+          mv artifacts/macos-release/wibo artifacts/out/wibo-macos
+          mv artifacts/macos-debug/wibo artifacts/out/wibo-macos-debug
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/out/*
+          draft: true
+          generate_release_notes: true
