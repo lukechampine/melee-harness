@@ -121,6 +121,31 @@ static const char *opcodes[] = {
 // forward declare
 static void enable_debug_output(void);
 
+static void call_formatoperands(void *pc, char *buf, int showBlocks)
+{
+#if defined(__i386__)
+    void(__cdecl *fn)(void *, char *, int) = mw_formatoperands;
+    __asm__ __volatile__(
+        "pushl %%ebx\n\t"
+        "pushl %%esi\n\t"
+        "pushl %%edi\n\t"
+        "pushl %[showBlocks]\n\t"
+        "pushl %[buf]\n\t"
+        "pushl %[pc]\n\t"
+        "call *%[fn]\n\t"
+        "addl $12, %%esp\n\t"
+        "popl %%edi\n\t"
+        "popl %%esi\n\t"
+        "popl %%ebx\n\t"
+        :
+        : [fn] "m"(fn), [pc] "m"(pc), [buf] "m"(buf),
+          [showBlocks] "m"(showBlocks)
+        : "eax", "ecx", "edx", "memory");
+#else
+    mw_formatoperands(pc, buf, showBlocks);
+#endif
+}
+
 // block listing, this is something that is needed and not provided by the compiler binary.
 // really this and the table above are the only additional things needed to make this complete
 static void list_block(PCodeBlock *block)
@@ -153,7 +178,7 @@ static void list_block(PCodeBlock *block)
     {
         char buf[500];
         buf[0] = '\0';
-        mw_formatoperands(ist, buf, 1);
+        call_formatoperands(ist, buf, 1);
 
         name = (ist->op >= 0 && ist->op < (int)OPCODE_NAME_COUNT)
                    ? opcodes[ist->op]
