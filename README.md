@@ -40,23 +40,26 @@ wibo/                  vendored wibo fork source:
 `melee-decomp`, `easy-funcs`, `ground-decomp`, `item-decomp`, `decomp-progress`,
 `mismatch-db`, `opseq`.
 
-## Building objdiff-cli
+## Building the vendored tools
 
-`objdiff/` is a vendored copy of a fork of
-[encounter/objdiff](https://github.com/encounter/objdiff):
+`./setup.sh` builds all three vendored tools and installs them into `./bin`
+(gitignored) so the scripts resolve them locally without touching the system
+`PATH`:
 
-- local additions vs upstream: unix-style diffs, percent output, `-f stack`
-  and `-f two-column` modes, `d=data` mark
-
-Requirements: Rust **1.88+** (edition 2024). Build and install it locally:
+| `bin/` artifact | source | needs |
+|---|---|---|
+| `objdiff-cli` | `objdiff/` (fork of [encounter/objdiff](https://github.com/encounter/objdiff): unix diffs, percent output, `-f stack`/`-f two-column`, `d=data`) | Rust **1.88+** (edition 2024); `Cargo.lock` pinned |
+| `wibo` | `wibo/` (patched fork — see below) | CMake; a non-venv Python ≥3.10 |
+| `MWDBG326.dll` (+ `lmgr326b.dll`) | `mwcc_debug/` (see below) | downloads a pinned Zig toolchain |
 
 ```sh
 ./setup.sh
 ```
 
-This runs a release build and installs the binary to `./bin/objdiff-cli`.
+Re-run any time; all three builds are incremental. The per-melee compiler
+patch (below) is a separate step `setup.sh` prints at the end.
 
-The tools resolve the binary via `tools/objdiff_path.py`, in this order:
+`objdiff-cli` is resolved via `tools/objdiff_path.py`, in this order:
 
 1. `$OBJDIFF_CLI` — explicit override
 2. `<harness>/bin/objdiff-cli` — what `./setup.sh` installs
@@ -84,35 +87,22 @@ Driven by `permute.py`.
 
 `mwcc_dump.py` compiles one melee TU with an instrumented MWCC and writes
 `pcdump.txt` (IR-optimizer decisions + every PPC-backend pass, with symbol
-names and `AFTER REGISTER COLORING` / `FINAL CODE`). Two pieces must be built
-first; both are macOS (Apple Silicon, via Rosetta) and vendored here as
-source because the fixes live as uncommitted working-tree changes.
+names and `AFTER REGISTER COLORING` / `FINAL CODE`). The DLL and the patched
+wibo are built by `./setup.sh` (above) into `bin/`; both are macOS (Apple
+Silicon, via Rosetta) and vendored as source because the fixes live as
+uncommitted working-tree changes.
 
-### 1. The mwcc_debug DLL + patched compiler
+### The mwcc_debug DLL
 
-`mwcc_debug/` builds `MWDBG326.dll`, a replacement for the MWCC v1.2.5n
-license-manager stub that flips on the compiler's dormant `debuglisting`
-output and calls its own `formatoperands` to dump every basic block.
+`mwcc_debug/` (built via `build_macos.sh`) produces `MWDBG326.dll`, a
+replacement for the MWCC v1.2.5n license-manager stub that flips on the
+compiler's dormant `debuglisting` output and calls its own `formatoperands`
+to dump every basic block.
 
-```sh
-cd mwcc_debug
-./build_macos.sh          # downloads a pinned Zig toolchain into tools/,
-                          # emits lmgr326b.dll and MWDBG326.dll
-# Patch a copy of the melee compiler so wibo loads the debug DLL
-# (wibo shims LMGR326B.dll, so the import is renamed to MWDBG326.dll):
-uv run patch_mwcceppc_for_wibo.py \
-    <melee>/build/compilers/GC/1.2.5n/mwcceppc.exe \
-    <melee>/build/compilers/GC/1.2.5n/mwcceppc_debug.exe
-```
-
-This leaves `mwcceppc_debug.exe` + `MWDBG326.dll` in the melee checkout's
-`build/compilers/GC/1.2.5n/`. `mwcc_dump.py` invokes `mwcceppc_debug.exe`;
-keep the unpatched `mwcceppc.exe` so the normal melee build is unaffected.
-
-### 2. The patched wibo
+### The patched wibo
 
 `wibo/` is a vendored copy of a fork of
-[decompals/wibo](https://github.com/decompals/wibo).
+[decompals/wibo](https://github.com/decompals/wibo):
 
 - `macros.S`: rewrites the `LJMP64` 32↔64-bit trampoline to build the far
   return on the stack instead of a shared writable `.data` slot — fixes the
@@ -120,24 +110,32 @@ keep the unpatched `mwcceppc.exe` so the normal melee build is unaffected.
 - `loader.cpp`/`main.cpp`/`modules.h`: relocate a nested PE off its
   preferred image base — fixes the `sjiswrap.exe → mwcceppc.exe` crash
 
-Build it:
-
-```sh
-cd wibo
-env -u VIRTUAL_ENV cmake --preset release-macos \
-    -DPython3_EXECUTABLE="$(brew --prefix)/bin/python3"
-env -u VIRTUAL_ENV cmake --build --preset release-macos
-# -> wibo/build/release/wibo
-```
-
 `mwcc_dump.py` resolves the wibo binary in this order:
 
 1. `$MWCC_WIBO` — explicit override
-2. `<melee>/../melee-harness/wibo/build/release/wibo` — sibling layout (the
-   normal case: the script runs as the melee overlay copy)
-3. `<harness>/wibo/build/release/wibo` — run in place from the harness
+2. `<harness>/bin/wibo` — what `./setup.sh` installs
+3. `<harness>/wibo/build/release/wibo` — raw cmake output
 4. `<melee>/build/tools/wibo` — stock fallback (crashes; the script's
    Wine fallback covers it)
+
+`<harness>` is tried both as the melee sibling (the script runs as the
+melee `tools/` overlay copy) and relative to the script itself.
+
+### Patch the compiler (per melee checkout)
+
+`./setup.sh` cannot touch the melee tree, so after it runs, point the debug
+DLL at a copy of the melee compiler (wibo shims `LMGR326B.dll`, so the
+import is renamed to `MWDBG326.dll`):
+
+```sh
+uv run mwcc_debug/patch_mwcceppc_for_wibo.py \
+    <melee>/build/compilers/GC/1.2.5n/mwcceppc.exe \
+    <melee>/build/compilers/GC/1.2.5n/mwcceppc_debug.exe \
+    --dll bin/MWDBG326.dll
+```
+
+`mwcc_dump.py` invokes `mwcceppc_debug.exe`; the unpatched `mwcceppc.exe`
+stays in place so the normal melee build is unaffected.
 
 ### Usage
 

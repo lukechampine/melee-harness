@@ -103,22 +103,28 @@ def summarize_dump(proc: subprocess.CompletedProcess[str], runner: str) -> None:
 def wibo_path() -> Path:
     """Resolve the patched wibo built in the harness. Order:
 
-      1. $MWCC_WIBO                                   explicit override
-      2. <melee>/../melee-harness/wibo/build/release/wibo   sibling layout
-         (the normal case: this script runs as the melee overlay copy)
-      3. <script>/../wibo/build/release/wibo          run in-place from harness
-      4. <melee>/build/tools/wibo                     stock fallback (still
-         crashes on @NNN temps / sjiswrap; the Wine fallback exists for this)
+      1. $MWCC_WIBO                          explicit override
+      2. <harness>/bin/wibo                  what ./setup.sh installs
+      3. <harness>/wibo/build/release/wibo   raw cmake output
+      4. <melee>/build/tools/wibo            stock fallback (still crashes on
+         @NNN temps / sjiswrap; the Wine fallback exists for this)
+
+    <harness> is tried both as the melee sibling (the normal case: this
+    script runs as the melee tools/ overlay copy) and relative to the
+    script itself (run in place from / symlinked out of the harness).
     """
     override = os.environ.get("MWCC_WIBO")
     if override:
         return Path(override)
-    for cand in (
-        ROOT.parent / "melee-harness" / "wibo" / "build" / "release" / "wibo",
-        Path(__file__).resolve().parents[1] / "wibo" / "build" / "release" / "wibo",
-    ):
-        if cand.is_file():
-            return cand
+    harness_roots = (
+        ROOT.parent / "melee-harness",
+        Path(__file__).resolve().parents[1],
+    )
+    for sub in (("bin", "wibo"), ("wibo", "build", "release", "wibo")):
+        for h in harness_roots:
+            cand = h.joinpath(*sub)
+            if cand.is_file():
+                return cand
     return ROOT / "build/tools/wibo"
 
 
