@@ -130,7 +130,7 @@ The naming convention for these symbols uses a stage abbreviation prefix: `grNBa
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py grBattle_8021A11C --no-copy --globals=none --no-casts
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py grBattle_8021A11C --no-copy --globals=none --no-casts
 ```
 Output:
 ```c
@@ -174,7 +174,7 @@ Empty diff -- 100% match!
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py grBattle_8021A19C --no-copy --globals=none --no-casts
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py grBattle_8021A19C --no-copy --globals=none --no-casts
 ```
 Output:
 ```c
@@ -220,7 +220,7 @@ Another 100% match!
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py grBattle_8021A20C --no-copy --globals=none --no-casts
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py grBattle_8021A20C --no-copy --globals=none --no-casts
 ```
 Output:
 ```c

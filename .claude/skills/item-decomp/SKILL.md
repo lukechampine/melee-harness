@@ -19,7 +19,7 @@ Some items also have associated attributes. These will be defined in ./src/melee
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py it_802E1C4C
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py it_802E1C4C
 ```
 Output:
 ```c
@@ -90,7 +90,7 @@ The diff is empty; 100% match!
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py itLinkarrow_UnkMotion1_Phys
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py itLinkarrow_UnkMotion1_Phys
 ```
 Output:
 ```c
@@ -113,7 +113,7 @@ void itLinkarrow_UnkMotion1_Phys(Item_GObj* arg0)
 
 decomp.py is defaulting to the `bombhei` field, which is wrong. The correct type is `itLinkArrow_ItemVars`; in the `Item_ItemVars` union, that field is named `linkarrow`. Force decomp.py to use this field:
 ```sh
-uv run ./tools/decomp.py itLinkarrow_UnkMotion1_Phys --union-field Item_ItemVars:linkarrow
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py itLinkarrow_UnkMotion1_Phys --union-field Item_ItemVars:linkarrow
 ```
 Output:
 ```c
@@ -134,7 +134,7 @@ void itLinkarrow_UnkMotion1_Phys(Item_GObj* arg0)
 
 The function also accesses `xC4_article_data->x4_specialAttributes`. Checking ./src/melee/it/itCommonItems.h, there is a `itLinkArrowAttributes` struct defined. Force m2c to use it:
 ```sh
-uv run ./tools/decomp.py itLinkarrow_UnkMotion1_Phys --union-field Item_ItemVars:linkarrow --void-field-type Article.x4_specialAttributes:itLinkArrowAttributes
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py itLinkarrow_UnkMotion1_Phys --union-field Item_ItemVars:linkarrow --void-field-type Article.x4_specialAttributes:itLinkArrowAttributes
 ```
 ```c
 void itLinkarrow_UnkMotion1_Phys(Item_GObj* arg0)
@@ -211,7 +211,7 @@ All done!
 
 Generate initial guess:
 ```sh
-uv run ./tools/decomp.py it_80295748
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py it_80295748
 ```
 Output:
 ```c
@@ -236,7 +236,7 @@ typedef struct {
 
 Now it can be specified with `--void-field-type`:
 ```sh
-uv run ./tools/decomp.py it_80295748 --void-field-type Article.x4_specialAttributes:itLipstickAttributes
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py it_80295748 --void-field-type Article.x4_specialAttributes:itLipstickAttributes
 ```
 Output:
 ```c

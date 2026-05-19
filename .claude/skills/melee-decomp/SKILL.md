@@ -11,11 +11,10 @@ description: Decompile individual Melee functions. Use whenever you are decompil
 
 If they were not already provided to you, locate the .c and .h files that will contain the decompiled source for this function using `rg <function_name>`. Usually, there will be a `/// #function_name` placeholder comment in the .c file, and a declaration in the .h file. After locating the file, check if you have any Skills relating to it (such as `item-decomp` for item-related functions).
 
-> **Invoking the tooling.** `decomp.py` is a melee-tree tool — run it from the
-> melee checkout (`uv run tools/decomp.py …`). The other scripts
-> (`checkdiff.py`, `stack_permute.py`, `permute.py`, `infer_struct.py`,
-> `mwcc_dump.py`) live in the sibling harness repo and are run **in place**
-> against the melee checkout via `MELEE_ROOT` — there is no symlink/overlay:
+> **Invoking the tooling.** All scripts (`decomp.py`, `checkdiff.py`,
+> `stack_permute.py`, `permute.py`, `infer_struct.py`, `mwcc_dump.py`) live
+> in the sibling harness repo and are run **in place** against the melee
+> checkout via `MELEE_ROOT` — there is no symlink/overlay:
 > ```sh
 > MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/<script>.py …
 > ```
@@ -23,7 +22,7 @@ If they were not already provided to you, locate the .c and .h files that will c
 
 Run `decomp.py` to get an initial guess:
 ```sh
-uv run tools/decomp.py --no-copy <function name> --globals=none --no-casts
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/decomp.py --no-copy <function name> --globals=none --no-casts
 ```
 
 Paste the output into the .c file. If there's a `/// #function_name` comment, replace it. Otherwise, append to the end of the file.

@@ -7,6 +7,14 @@ objdiff/target/
 # objdiff fork's own Claude config — not part of the harness
 objdiff/.claude/
 
+# m2c fork's own Claude config — not part of the harness
+/m2c/.claude/
+
+# m2c editable-install / build artifacts (also covered by m2c/.gitignore)
+/m2c/*.egg-info/
+/m2c/venv/
+/m2c/.venv/
+
 # Python
 __pycache__/
 *.pyc

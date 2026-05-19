@@ -5,10 +5,10 @@ decomp project.
 
 ## Invoking the tools
 
-Every script in this repo's `tools/` (`checkdiff.py`, `stack_permute.py`,
-`permute.py`, `infer_struct.py`, `mwcc_dump.py`, `fix_includes.py`,
-`gen_item_state_table.py`) is run in place with `MELEE_ROOT` pointing at the
-melee checkout:
+Every script in this repo's `tools/` (`decomp.py`, `checkdiff.py`,
+`stack_permute.py`, `permute.py`, `infer_struct.py`, `mwcc_dump.py`,
+`fix_includes.py`, `gen_item_state_table.py`) is run in place with
+`MELEE_ROOT` pointing at the melee checkout:
 
 ```sh
 MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py <fn>
@@ -37,12 +37,16 @@ wibo/                  vendored wibo fork source:
                        fixes the formatoperands SIGBUS and the sjiswrap
                        nested-PE crash (build instructions below)
 decomp-permuter/       vendored decomp-permuter fork (setup below)
+m2c/                   vendored m2c fork (the decompiler tools/decomp.py
+                       drives; adds --void-field-type / --void-var-type;
+                       no setup — see below)
 ```
 
 ### tools/
 
 | script | purpose |
 |---|---|
+| `decomp.py` | run the vendored m2c fork on a function/TU (vendored from the melee tree; m2c wired via PYTHONPATH) |
 | `checkdiff.py` | stack-frame autofix + rebuild + objdiff-cli diff for a function |
 | `stack_permute.py` | stack-ordering permuter |
 | `permute.py` | wrapper around the vendored decomp-permuter |
@@ -120,6 +124,45 @@ Driven by `permute.py`, which runs the permuter's `import.py` with
 `compiler_type`, `asm_pattern`, etc.). It lives at the harness root rather
 than inside the vendored fork, so the fork stays a clean upstream copy and
 no `permuter_settings.toml` is needed in the melee checkout.
+
+## Setting up m2c
+
+`m2c/` is a vendored copy of a fork of
+[m2c](https://github.com/matt-kempster/m2c) (fork:
+[lukechampine/m2c](https://github.com/lukechampine/m2c), branch `vibing`,
+four commits past upstream `f201e88`). The custom commits add the
+`--void-var-type` and `--void-field-type` flags and single-expression
+struct copying — the `--void-field-type` / `--void-var-type` invocations
+the `melee-decomp` / `ground-decomp` / `item-decomp` skills rely on come
+from this fork, so stock upstream m2c is **not** a substitute.
+
+**There is no setup step.** m2c is driven by `tools/decomp.py`, which is
+also vendored here (it was the melee tree's `tools/decomp.py`, rewired for
+the harness). It runs in place like the other scripts:
+
+```sh
+MELEE_ROOT=~/melee uv run --project ~/melee-harness \
+    ~/melee-harness/tools/decomp.py <function|tu> [m2c args...]
+```
+
+`decomp.py` invokes m2c with `<harness>/m2c` prepended to `PYTHONPATH`, so
+`-m m2c.main` (and its bundled `m2c_pycparser`) always resolve to the
+vendored fork — no install, and no dependency on the melee `.venv`. Its
+two third-party deps are declared via PEP 723 inline metadata so `uv run`
+provisions them automatically: `pyelftools` (function → obj/asm lookup)
+and `pcpp` (the melee tree's `tools/m2ctx/m2ctx.py --preprocessor`, which
+`decomp.py` shells out to for `build/ctx.c`). `m2ctx` stays in the melee
+tree — it is pure stdlib and self-locating; `decomp.py` runs it with
+`cwd` pinned to the melee root so pcpp's relative include dirs resolve.
+
+Pulling harness changes that touch `m2c/` takes effect immediately; there
+is nothing to reinstall. Verify the vendored fork is what runs with:
+
+```sh
+PYTHONPATH=<harness>/m2c uv run --project <harness> \
+    python -c "import m2c; print(m2c.__file__)"
+# -> <harness>/m2c/m2c/__init__.py
+```
 
 ## Building the mwcc_debug compiler + patched wibo
 

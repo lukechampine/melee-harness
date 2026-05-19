@@ -163,7 +163,6 @@ def direct_compile(obj_path: str) -> Optional[CompiledObject]:
     cmd += [
         str(compiler),
         *shlex.split(block.cflags),
-        "-MMD",
         "-c",
         block.src,
         "-o",
