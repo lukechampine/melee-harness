@@ -455,7 +455,11 @@ def _enclosing_temp_stmt(n: Node):
                     return p, "decl"
             return None, None
         if p.type in STMT_TYPES:
-            if p.type in ("expression_statement", "return_statement"):
+            # if/switch conditions are evaluated once, so hoisting a subexpression
+            # before them is behaviour-preserving. while/for/do conditions
+            # re-evaluate each iteration, so they're left out.
+            if p.type in ("expression_statement", "return_statement",
+                          "if_statement", "switch_statement"):
                 return p, "wrap"
             return None, None
         p = p.parent
@@ -474,17 +478,23 @@ def _extract_unsafe(n: Node, stmt: Node) -> bool:
             return True
         if par.type == "call_expression" and _same(field(par, "function")):
             return True
+    def _is(a: Optional[Node]) -> bool:
+        return a is not None and a.start_byte == p.start_byte and a.end_byte == p.end_byte
     p = n
-    while p is not None and p is not stmt:
+    while p is not None and not _is(stmt):
         anc = p.parent
         if anc is None:
             break
-        if anc.type in ("conditional_expression", "sizeof_expression"):
+        if anc.type == "sizeof_expression":
             return True
-        if anc.type == "binary_expression":
-            op = field(anc, "operator")
-            if op is not None and op.text in (b"&&", b"||"):
+        if anc.type == "conditional_expression":
+            # the controlling condition is always evaluated; the branches aren't
+            if not _is(field(anc, "condition")):
                 return True
+        elif anc.type == "binary_expression":
+            op = field(anc, "operator")
+            if op is not None and op.text in (b"&&", b"||") and _is(field(anc, "right")):
+                return True   # short-circuited right operand
         p = anc
     return False
 
@@ -507,6 +517,13 @@ def p_temp_for_expr(ctx: Ctx) -> Optional[List[Edit]]:
         stmt, mode = _enclosing_temp_stmt(n)
         if stmt is None or _extract_unsafe(n, stmt):
             continue
+        # Skip the whole (discarded) expression of an expression_statement: it's
+        # pointless to temp, and is often a statement-macro (e.g. PAD_STACK) that
+        # clang gives a type to but isn't a real assignable rvalue.
+        if mode == "wrap" and stmt.type == "expression_statement":
+            inner = stmt.named_children[0] if stmt.named_children else None
+            if inner is not None and (inner.start_byte, inner.end_byte) == (n.start_byte, n.end_byte):
+                continue
         cands.append((n, typ, stmt, mode))
     if not cands:
         return None
