@@ -446,9 +446,21 @@ class Mutator:
             (n, f, (weights or {}).get(n, w)) for n, f, w in passes
         ]
 
-    def step(self, src: bytes, rng: random.Random) -> Optional[bytes]:
-        tree = parse(src)
-        fn = find_function(tree.root_node, self.fn_name)
+    def step(
+        self,
+        src: bytes,
+        rng: random.Random,
+        *,
+        tree: Optional[Tree] = None,
+        fn: Optional[Node] = None,
+    ) -> Optional[bytes]:
+        # `tree`/`fn` let a caller pass a pre-parsed tree for `src` (e.g. the
+        # cached parse of the unchanged base source), avoiding a re-parse +
+        # find_function on the hot path. They must correspond to `src`.
+        if tree is None:
+            tree = parse(src)
+        if fn is None:
+            fn = find_function(tree.root_node, self.fn_name)
         if fn is None:
             return None
         pool = [(n, f, w) for n, f, w in self.passes if w > 0]

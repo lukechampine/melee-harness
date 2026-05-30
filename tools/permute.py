@@ -151,12 +151,7 @@ def report_find(sh: Shared, score: int, source: bytes, cand_o: Path) -> None:
     pct = objdiff_percent(sh.unit, sh.fn, cand_o)
     delta = score - sh.base_score
     pstr = f", {pct:.2f}%" if pct is not None else ""
-    nm = ROOT / "nonmatchings" / sh.fn
-    nm.mkdir(parents=True, exist_ok=True)
-    out = nm / f"found-{score}.c"
-    out.write_bytes(source)
-    print(f"\n*** improvement: score {score} (delta {delta:+d}{pstr}) "
-          f"-> {out} ***")
+    print(f"\n*** improvement: score {score} (delta {delta:+d}{pstr}) ***")
     print(unified_diff(sh.unit, sh.base_source, source), end="")
     sys.stdout.flush()
 
@@ -190,6 +185,13 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
     rng = random.Random(seed)
     scorer = make_scorer(sh.unit, sh.fn)
     base_prefix = sh.base_source[:sh.split]
+    # Parse the base source once per worker; ~75% of steps restart from it
+    # (keep_prob), so reusing this tree avoids re-parsing the whole .c each time.
+    base_tree = src_mutate.parse(sh.base_source)
+    base_fns = {
+        name: src_mutate.find_function(base_tree.root_node, name)
+        for name in set(mutate_fns)
+    }
     cur = sh.base_source
     tm = tc = ts = 0.0          # per-thread phase timers (merged at exit)
     n_none = n_dup = 0
@@ -203,7 +205,11 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                 attempts += 1
                 if cur is not sh.base_source and rng.random() >= sh.keep_prob:
                     cur = sh.base_source
-                cand = mutators[rng.choice(mutate_fns)].step(cur, rng)
+                mfn = rng.choice(mutate_fns)
+                if cur is sh.base_source:
+                    cand = mutators[mfn].step(cur, rng, tree=base_tree, fn=base_fns[mfn])
+                else:
+                    cand = mutators[mfn].step(cur, rng)
                 if cand is None:
                     n_none += 1
                     cur = sh.base_source
@@ -441,9 +447,8 @@ def main() -> int:
         c_file.write_bytes(best_source)
         print(f"applied best candidate to {c_file}")
     else:
-        hint = "--apply=always" if matched else "--apply=always (partial)"
-        print(f"(not applied; re-run with {hint} to write to {c_file}, "
-              f"or use nonmatchings/{fn}/found-{best_score}.c)")
+        print(f"(not applied; apply the diff above, or re-run with "
+              f"--apply=always to write to {c_file})")
     return 0
 
 
