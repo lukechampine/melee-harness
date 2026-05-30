@@ -117,11 +117,11 @@ Other minor mismatches (such as regswaps) can sometimes be resolved by randomly 
 MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/permute.py <function name> --timeout 60
 ```
 
-This will rapidly test random permutations for up to 60 seconds, then output a diff for the best result. Since the permuter works on preprocessed C, the diff will typically not cleanly apply as-is; you must apply it manually.
+This rapidly tests random permutations of the real source for up to 60 seconds, and stops as soon as it finds a 100% match. It mutates the actual `.c` (preserving macros and formatting), so a find is a real diff: by default (`--apply=match`) it writes a 100% match straight back into the source file. Pass `--apply=never` to only print the diff, or `--apply=always` to also keep a partial improvement.
 
 As with `stack_permute.py`, you should only use the permuter for functions that are close to matching. For example, do not use the permuter when the checkdiff.py output shows additional or missing instructions, as this is likely to be a waste of time. Also refrain from setting a timeout longer than 60 seconds.
 
-By default, `permute.py` only permutes the specified function. Read its doccomment to learn more advanced invocation patterns, such as permuting helper functions.
+By default, `permute.py` only permutes the specified function. Read its doccomment to learn more advanced invocation patterns, such as permuting helper functions while scoring a caller.
 
 ### Determining struct field types
 

@@ -6,25 +6,28 @@ decomp project.
 ## Invoking the tools
 
 Every script in this repo's `tools/` (`decomp.py`, `checkdiff.py`,
-`stack_permute.py`, `permute.py`, `infer_struct.py`, `mwcc_dump.py`,
-`fix_includes.py`, `gen_item_state_table.py`) is run in place with
-`MELEE_ROOT` pointing at the melee checkout:
+`stack_permute.py`, `permute.py`, `infer_struct.py`,
+`mwcc_dump.py`, `mwcc_diagnose.py`, `fix_includes.py`,
+`gen_item_state_table.py`) is run in place against a melee checkout:
 
 ```sh
-MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/checkdiff.py <fn>
+# from anywhere inside the checkout, MELEE_ROOT is auto-detected:
+cd ~/melee && uv run ~/melee-harness/tools/checkdiff.py <fn>
+
+# or point at it explicitly from anywhere:
+MELEE_ROOT=~/melee uv run ~/melee-harness/tools/checkdiff.py <fn>
 ```
 
-The scripts resolve the melee checkout as `$MELEE_ROOT`, then
-`$CLAUDE_PROJECT_DIR`, then (last resort) the script's parent dir — so set
-`MELEE_ROOT` explicitly for any manual invocation.
+The scripts resolve the melee checkout (via `tools/melee_root.py`) as
+`$MELEE_ROOT`, then `$CLAUDE_PROJECT_DIR`, then by walking up from the current
+directory for a `build/GALE01` marker — so when you run from inside a checkout
+you can omit `MELEE_ROOT` entirely. The resolved root is always made absolute.
 
 ## Layout
 
 ```
 tools/                 custom decomp scripts (run in place via MELEE_ROOT)
 sync.sh                copy .claude/ overlay into a melee checkout
-permuter_settings.toml melee-specific decomp-permuter config; permute.py
-                       passes it via --settings
 .claude/
   skills/              Claude Code skills (copied into melee via ./sync.sh)
   hooks/               PostToolUse hook scripts, co-located with settings.json
@@ -36,7 +39,6 @@ mwcc_debug/            mwcc_debug DLL source: patches MWCC v1.2.5n to emit
 wibo/                  vendored wibo fork source:
                        fixes the formatoperands SIGBUS and the sjiswrap
                        nested-PE crash (build instructions below)
-decomp-permuter/       vendored decomp-permuter fork (setup below)
 m2c/                   vendored m2c fork (the decompiler tools/decomp.py
                        drives; adds --void-field-type / --void-var-type;
                        no setup — see below)
@@ -49,11 +51,15 @@ m2c/                   vendored m2c fork (the decompiler tools/decomp.py
 | `decomp.py` | run the vendored m2c fork on a function/TU (vendored from the melee tree; m2c wired via PYTHONPATH) |
 | `checkdiff.py` | stack-frame autofix + rebuild + objdiff-cli diff for a function |
 | `stack_permute.py` | stack-ordering permuter |
-| `permute.py` | wrapper around the vendored decomp-permuter |
+| `permute.py` | source-level permuter: mutates the **real** TU via tree-sitter byte-span edits, compiles it with the exact `build.ninja` mwcc command, scores in-process against the real target. Findings are real diffs that `git apply` to `src/`; by default (`--apply=match`) it writes a 100% match straight back to the source and stops as soon as it finds one. Precompiles the TU's header block once (mwcc PCH) and recompiles only the mutated body per candidate (auto fidelity-gated, `--no-pch` to disable), and compiles K candidates per mwcc invocation (`--batch`, default 16) to amortize process startup with per-candidate salvage on error — together ~5× the throughput of a naive full compile. `--profile` prints a per-phase timing breakdown. |
+| `src_mutate.py` | tree-sitter mutation engine backing `permute.py` (reorder decls/stmts/params, commutative/add-sub/struct-ref/condition rewrites, pad var, …); runnable standalone to preview one mutation as a diff |
+| `ninja_compile.py` | compile one TU with its `build.ninja` mwcc command (no Ninja), incl. precompiled-header build (`build_pch`) + `-prefix` reuse; shared by `checkdiff.py` and `permute.py` |
+| `scorer.py`, `objdump.py` | vendored from decomp-permuter (MIT): the in-process objdump-based scorer `permute.py` uses to rank candidates against the target |
 | `infer_struct.py` | struct field inference |
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
 | `mwcc_dump.py` | dump the mwcc_debug compiler's listing for one function → `pcdump.txt` |
+| `mwcc_diagnose.py` | mode-oriented mismatch diagnostics that combine checkdiff/objdiff with mwcc_dump |
 
 ### .claude/hooks/
 
@@ -107,24 +113,6 @@ patch (below) is a separate step `setup.sh` prints at the end.
 `<harness>` is located relative to the script, so this works wherever the
 tools run in place from.
 
-## Setting up decomp-permuter
-
-`decomp-permuter/` is a vendored copy of a fork of
-[decomp-permuter](https://github.com/jellejurre/decomp-permuter):
-
-It uses [`uv`](https://docs.astral.sh/uv/); `uv.lock` is vendored, so:
-
-```sh
-cd decomp-permuter
-uv sync
-```
-
-Driven by `permute.py`, which runs the permuter's `import.py` with
-`--settings <harness>/permuter_settings.toml` (the melee-specific config —
-`compiler_type`, `asm_pattern`, etc.). It lives at the harness root rather
-than inside the vendored fork, so the fork stays a clean upstream copy and
-no `permuter_settings.toml` is needed in the melee checkout.
-
 ## Setting up m2c
 
 `m2c/` is a vendored copy of a fork of
@@ -168,7 +156,8 @@ PYTHONPATH=<harness>/m2c uv run --project <harness> \
 
 `mwcc_dump.py` takes a **function name**, resolves its TU via
 `build/GALE01/report.json` (the same lookup `checkdiff.py` uses), compiles
-that TU with an instrumented MWCC, then truncates `pcdump.txt` to just that
+that TU with an instrumented MWCC from a unique working directory under
+`build/mwcc-dump/`, then truncates that run's `pcdump.txt` to just that
 function's section (IR-optimizer decisions + every PPC-backend pass, with
 symbol names and `AFTER REGISTER COLORING` / `FINAL CODE`) so the output
 concerns only that function. The DLL and the patched
@@ -225,9 +214,21 @@ stays in place so the normal melee build is unaffected.
 MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/mwcc_dump.py it_802E70BC
 ```
 
-This writes a `pcdump.txt` into the melee checkout. If the function isn't in
-`pcdump.txt` (inlined away, or a wrong name), the full dump is left in place and
-the names that *are* present are listed.
+This writes a unique `build/mwcc-dump/<function>-*/pcdump.txt` in the melee
+checkout and prints the exact path. If the function isn't in `pcdump.txt`
+(inlined away, or a wrong name), the full dump is left in place and the names
+that *are* present are listed.
 
 Defaults to the patched wibo with an automatic Wine fallback on SIGBUS
 (`--runner wibo` / `--runner wine` to force one).
+
+For stack-heavy objdiff summaries, run the first diagnostic mode:
+
+```sh
+MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/mwcc_diagnose.py stack it_8026CD50
+```
+
+`mwcc_diagnose.py stack` runs checkdiff's temporary compile/diff path without
+the stack-frame autofix, lists the target/current `r1` offset deltas, then adds
+mwcc_dump's current-C frame and stack-slot summary with guidance for likely
+local ordering, aggregate, padding, or hidden-temp causes.

@@ -1,297 +1,449 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["tree-sitter", "tree-sitter-c"]
+# ///
 """
-Run the decomp-permuter on a function, identified by name.
+Source-level permuter for melee. Unlike the vendored decomp-permuter (which
+mutates a macro-expanded, pretty-printed copy of the source), this mutates the
+**real** translation unit text via tree-sitter byte-span edits (src_mutate.py),
+compiles the real TU with the exact mwcc command from build.ninja
+(ninja_compile.py), and scores in-process against the real build target
+(scorer.py, a vendored objdump scorer, isolated to one function). A win is
+printed as a unified diff that applies straight to src/.../*.c with `git apply`.
 
 Usage:
-  tools/permute.py <func_name> [permute_fn ...] [permuter_args...]
-  tools/permute.py fn_802B7E34 tools/permute.py fn_802B7E34 my_helper
-  # randomize ONLY my_helper tools/permute.py fn_802B7E34 fn_802B7E34 my_helper
-  # randomize both tools/permute.py fn_802B7E34 helper_a helper_b      #
-  randomize multiple tools/permute.py fn_802B7E34 -j4 tools/permute.py
-  fn_802B7E34 --reimport             # re-import even if exists
+  permute.py <func_name> [permute_fn ...] [options]
 
-The first positional argument is the function whose object code is matched
-against the target binary. Any subsequent positional arguments form the set of
-functions to randomize each iteration; the randomizer picks one of them
-uniformly per iteration.
+  <func_name>     function whose object code is scored against the target
+  [permute_fn]    function(s) to mutate each iteration (default: func_name).
+                  If given, ONLY these are mutated (one chosen per iteration);
+                  func_name is mutated only if listed. They must live in the
+                  same translation unit as func_name.
 
-If no extra positional arguments are given, the randomizer permutes the match
-target itself (the usual behaviour). If one or more are given, ONLY those
-functions are randomized — the match target is permuted only if you list it
-explicitly. This lets you focus the permuter on a single helper while still
-scoring against the caller's compiled output.
+Options:
+  -j N            worker threads (default 8)
+  --timeout S     stop after S seconds
+  --seed N        base RNG seed (default 0)
+  --keep-prob P   probability of stacking another mutation vs. restarting from
+                  the original source each step (default 0.25)
+  --apply MODE    write the best candidate back to the real source:
+                    match   (default) only on a 100% match
+                    always  even for a partial improvement
+                    never   leave the source untouched
+  --max-iters N   stop after N compiled candidates
 
-On Ctrl+C, prints the best diff found so far.
+The search always stops as soon as a 100% match (score 0) is found. On Ctrl+C /
+timeout / max-iters, prints the best diff found so far.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
 import os
-import shutil
+import random
 import signal
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
-from objdiff_path import objdiff_cli
-
-# Melee checkout root: explicit override, then Claude Code's project dir,
-# then assume this script lives at <melee>/tools/.
-ROOT = Path(
-    os.environ.get("MELEE_ROOT")
-    or os.environ.get("CLAUDE_PROJECT_DIR")
-    or Path(__file__).resolve().parents[1]
-)
-REPORT_PATH = ROOT / "build/GALE01/report.json"
-SRC_ROOT = ROOT / "src"
-# Vendored decomp-permuter and its melee-specific settings live at the
-# harness root (a top-level fork dir, out of the melee tree); the settings
-# are passed to import.py via --settings.
 _HARNESS = Path(__file__).resolve().parents[1]
-PERMUTER = _HARNESS / "decomp-permuter"
-PERMUTER_SETTINGS = _HARNESS / "permuter_settings.toml"
-NONMATCHINGS = ROOT / "nonmatchings"
+sys.path.insert(0, str(_HARNESS / "tools"))            # for sibling modules
+
+import src_mutate  # noqa: E402
+from ninja_compile import (  # noqa: E402
+    ROOT,
+    build_pch,
+    compile_batch,
+    compile_source_text,
+    find_unit_for_function,
+)
+from objdiff_path import objdiff_cli  # noqa: E402
+from scorer import Scorer  # noqa: E402
+
+PPC_OBJDUMP = ROOT / "build/binutils/powerpc-eabi-objdump"
 
 
-def find_unit_for_function(func_name: str) -> Optional[str]:
-    with REPORT_PATH.open("r") as f:
-        for unit in json.load(f).get("units", []):
-            for function in unit.get("functions", []):
-                if function.get("name") == func_name:
-                    return unit.get("name", "").removeprefix("main/")
-    return None
+def objdump_command(fn: str) -> str:
+    # Match decomp-permuter's PPC defaults (raw bytes + relocs) so its parser
+    # works, then restrict to one symbol to isolate the function in a real,
+    # multi-function TU object.
+    return f"{PPC_OBJDUMP} -dr -EB -mpowerpc -M broadway --disassemble={fn}"
 
 
-def diff_size(d: Path) -> int:
-    """Size of the diff.diff file in this output directory."""
-    diff_file = d / "diff.diff"
-    if diff_file.exists():
-        return len(diff_file.read_text())
-    return 0
+def make_scorer(unit: str, fn: str) -> Scorer:
+    return Scorer(
+        str(ROOT / f"build/GALE01/obj/{unit}.o"),
+        stack_differences=True,
+        algorithm="difflib",
+        debug_mode=False,
+        ign_branch_targets=False,
+        objdump_command=objdump_command(fn),
+    )
 
 
-def _objdiff_percent(target_o: Path, cand_o: Path, func_name: str) -> Optional[float]:
+def objdiff_percent(unit: str, fn: str, cand_o: Path) -> Optional[float]:
     try:
-        result = subprocess.run(
-            [
-                objdiff_cli(), "diff",
-                "--format", "percent",
-                "-c", "functionRelocDiffs=data_value",
-                "-1", str(target_o),
-                "-2", str(cand_o),
-                func_name,
-            ],
-            capture_output=True,
-            text=True,
+        r = subprocess.run(
+            [objdiff_cli(), "diff", "--format", "percent",
+             "-c", "functionRelocDiffs=data_value",
+             "-1", str(ROOT / f"build/GALE01/obj/{unit}.o"),
+             "-2", str(cand_o), fn],
+            capture_output=True, text=True, timeout=30,
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    if result.returncode != 0:
+    if r.returncode != 0:
         return None
     try:
-        return float(result.stdout.strip())
+        return float(r.stdout.strip())
     except ValueError:
         return None
 
 
+def unified_diff(unit: str, base: bytes, cand: bytes) -> str:
+    import difflib
+    rel = f"src/{unit}.c"
+    a = base.decode("utf-8", "replace").splitlines(keepends=True)
+    b = cand.decode("utf-8", "replace").splitlines(keepends=True)
+    return "".join(
+        difflib.unified_diff(a, b, fromfile=f"a/{rel}", tofile=f"b/{rel}")
+    )
 
-DISCLAIMER = "Note: percentages calculated from synthesized TU, not original source"
+
+@dataclass
+class Shared:
+    base_score: int
+    base_source: bytes
+    unit: str
+    fn: str
+    keep_prob: float
+    max_iters: Optional[int]
+    use_pch: bool = False
+    split: int = 0
+    pch_path: Optional[Path] = None
+    batch: int = 8
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    stop: threading.Event = field(default_factory=threading.Event)
+    best_score: int = 0
+    best_source: Optional[bytes] = None
+    best_percent: Optional[float] = None
+    iters: int = 0
+    compiles_failed: int = 0
+    n_mutate_none: int = 0
+    n_dup: int = 0
+    prof_mutate: float = 0.0
+    prof_compile: float = 0.0
+    prof_score: float = 0.0
+    seen_source: Set[bytes] = field(default_factory=set)
+    seen_asm: Set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.best_score = self.base_score
 
 
-def _compile_candidate(nonmatch_dir: Path, source_c: Path, cand_o: Path) -> bool:
-    """Compile source_c via the nonmatch_dir's compile.sh into cand_o."""
-    compile_sh = nonmatch_dir / "compile.sh"
-    # compile.sh resolves $3 with realpath, which on macOS errors on a
-    # non-existent path — touch the output first.
-    cand_o.touch()
+def report_find(sh: Shared, score: int, source: bytes, cand_o: Path) -> None:
+    pct = objdiff_percent(sh.unit, sh.fn, cand_o)
+    delta = score - sh.base_score
+    pstr = f", {pct:.2f}%" if pct is not None else ""
+    nm = ROOT / "nonmatchings" / sh.fn
+    nm.mkdir(parents=True, exist_ok=True)
+    out = nm / f"found-{score}.c"
+    out.write_bytes(source)
+    print(f"\n*** improvement: score {score} (delta {delta:+d}{pstr}) "
+          f"-> {out} ***")
+    print(unified_diff(sh.unit, sh.base_source, source), end="")
+    sys.stdout.flush()
+
+
+def print_profile(sh: Shared, elapsed: float, jobs: int) -> None:
+    worker_wall = jobs * elapsed
+    n_mut = sh.iters + sh.compiles_failed + sh.n_dup + sh.n_mutate_none
+    n_comp = sh.iters + sh.compiles_failed
+    n_score = sh.iters
+
+    def row(name: str, total: float, count: int) -> None:
+        mean = (total / count * 1000) if count else 0.0
+        pct = (total / worker_wall * 100) if worker_wall else 0.0
+        print(f"  {name:8s} {total:8.2f}s  {pct:5.1f}%  {mean:7.2f} ms/call  ({count} calls)")
+
+    print("\n--- profile (summed across workers) ---")
+    print(f"  wall {elapsed:.1f}s x {jobs} workers = {worker_wall:.1f}s worker-time; "
+          f"{sh.iters} scored ({sh.iters / elapsed:.1f}/s)")
+    print(f"  compile-fail {sh.compiles_failed}, dup {sh.n_dup}, no-mutation {sh.n_mutate_none}")
+    row("mutate", sh.prof_mutate, n_mut)
+    row("compile", sh.prof_compile, n_comp)
+    row("score", sh.prof_score, n_score)
+    acc = sh.prof_mutate + sh.prof_compile + sh.prof_score
+    if worker_wall:
+        print(f"  accounted {acc:.1f}s ({acc / worker_wall * 100:.0f}% of worker-time; "
+              f"rest = lock/dedup/tempfile/idle)")
+
+
+def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
+           mutate_fns: List[str], seed: int) -> None:
+    rng = random.Random(seed)
+    scorer = make_scorer(sh.unit, sh.fn)
+    base_prefix = sh.base_source[:sh.split]
+    cur = sh.base_source
+    tm = tc = ts = 0.0          # per-thread phase timers (merged at exit)
+    n_none = n_dup = 0
     try:
-        result = subprocess.run(
-            ["bash", str(compile_sh), str(source_c), "x", str(cand_o)],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return result.returncode == 0
+        while not sh.stop.is_set():
+            # --- build a batch of distinct, compilable-looking candidates ---
+            t0 = time.perf_counter()
+            cands: list = []
+            attempts = 0
+            while len(cands) < sh.batch and attempts < sh.batch * 4:
+                attempts += 1
+                if cur is not sh.base_source and rng.random() >= sh.keep_prob:
+                    cur = sh.base_source
+                cand = mutators[rng.choice(mutate_fns)].step(cur, rng)
+                if cand is None:
+                    n_none += 1
+                    cur = sh.base_source
+                    continue
+                cur = cand
+                h = hashlib.sha256(cand).digest()
+                with sh.lock:
+                    dup = h in sh.seen_source
+                    if not dup and len(sh.seen_source) < 200_000:
+                        sh.seen_source.add(h)
+                if dup:
+                    n_dup += 1
+                    continue
+                cands.append(cand)
+            tm += time.perf_counter() - t0
+            if not cands:
+                continue
 
+            # --- compile the whole batch in one mwcc invocation ---
+            t0 = time.perf_counter()
+            if sh.use_pch and all(c[:sh.split] == base_prefix for c in cands):
+                sources = [c[sh.split:].decode("utf-8", "surrogateescape") for c in cands]
+                objs, cleanups = compile_batch(sh.unit, sources, prefix_pch=sh.pch_path)
+            else:
+                sources = [c.decode("utf-8", "surrogateescape") for c in cands]
+                objs, cleanups = compile_batch(sh.unit, sources)
+            tc += time.perf_counter() - t0
 
-def show_best(
-    nonmatch_dir: Path, func_name: str, baseline: Optional[float]
-) -> None:
-    """Pick the candidate with the highest objdiff percent against target.o.
-    The baseline is what the wrapper printed at the top — used here to show
-    the delta. Returns early without printing anything when no candidate
-    beats the baseline (the live counter already showed where we ended up)."""
-    target_o = nonmatch_dir / "target.o"
-    cand_o = nonmatch_dir / "best.o"
-
-    best_dir: Optional[Path] = None
-    best_percent: Optional[float] = baseline
-    for d in sorted(nonmatch_dir.iterdir()):
-        if not d.is_dir() or not d.name.startswith("output-"):
-            continue
-        source_c = d / "source.c"
-        if not source_c.exists():
-            continue
-        if not _compile_candidate(nonmatch_dir, source_c, cand_o):
-            continue
-        pct = _objdiff_percent(target_o, cand_o, func_name)
-        if pct is None:
-            continue
-        if best_percent is None or pct > best_percent:
-            best_percent = pct
-            best_dir = d
-
-    if best_dir is None or best_percent is None:
-        return
-
-    if baseline is not None:
-        delta = best_percent - baseline
-        print(f"\nBest score: {best_percent:.2f}% ({delta:+.2f}%)")
-    else:
-        print(f"\nBest score: {best_percent:.2f}%")
-    diff_file = best_dir / "diff.diff"
-    if diff_file.exists():
-        print(diff_file.read_text(), end="")
+            # --- score each candidate ---
+            try:
+                for cand, obj in zip(cands, objs):
+                    if sh.stop.is_set():
+                        break
+                    if obj is None:
+                        with sh.lock:
+                            sh.compiles_failed += 1
+                        continue
+                    if not obj.exists():
+                        continue  # vanished (e.g. tmpdir cleaned during shutdown)
+                    t0 = time.perf_counter()
+                    try:
+                        score, asm_hash = scorer.score(str(obj))
+                    except (subprocess.CalledProcessError, OSError) as e:
+                        # Ctrl-C reaches the in-flight objdump as SIGINT (the only
+                        # check_output in the loop). Shut down quietly instead of
+                        # letting the worker thread dump a traceback.
+                        if sh.stop.is_set() or (
+                            isinstance(e, subprocess.CalledProcessError)
+                            and (e.returncode or 0) < 0
+                        ):
+                            sh.stop.set()
+                            break
+                        raise
+                    ts += time.perf_counter() - t0
+                    with sh.lock:
+                        sh.iters += 1
+                        improved = score < sh.best_score
+                        is_zero = score == 0
+                        new_asm = asm_hash not in sh.seen_asm
+                        if improved:
+                            sh.best_score = score
+                            sh.best_source = cand
+                        if (improved or is_zero) and new_asm:
+                            sh.seen_asm.add(asm_hash)
+                            report_find(sh, score, cand, obj)
+                        if is_zero:
+                            sh.stop.set()  # 100% match: stop the whole search
+                        if sh.max_iters is not None and sh.iters >= sh.max_iters:
+                            sh.stop.set()
+            finally:
+                for c in cleanups:
+                    c.cleanup()
+    finally:
+        with sh.lock:
+            sh.prof_mutate += tm
+            sh.prof_compile += tc
+            sh.prof_score += ts
+            sh.n_mutate_none += n_none
+            sh.n_dup += n_dup
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "func_name",
-        help="Function whose .o output is matched against the target binary",
-    )
-    parser.add_argument(
-        "permute_fn_names",
-        nargs="*",
-        metavar="permute_fn",
-        help="Functions to randomize each iteration. If omitted, defaults to "
-        "func_name (standard behaviour). If given, ONLY these functions are "
-        "randomized — func_name is permuted only if explicitly listed.",
-    )
-    parser.add_argument(
-        "--reimport",
-        action="store_true",
-        help="Re-import the function even if it already exists",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=None,
-        metavar="SECONDS",
-        help="Stop the permuter after this many seconds",
-    )
-    args, permuter_args = parser.parse_known_args()
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("func_name")
+    ap.add_argument("permute_fn_names", nargs="*", metavar="permute_fn")
+    ap.add_argument("-j", type=int, default=8, dest="jobs")
+    ap.add_argument("--timeout", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--keep-prob", type=float, default=0.25)
+    ap.add_argument("--apply", choices=["match", "always", "never"], default="match",
+                    help="write the best candidate back to the real source: "
+                         "'match' (default) only on a 100%% match, 'always' even "
+                         "for a partial improvement, 'never' to leave it alone")
+    ap.add_argument("--max-iters", type=int, default=None)
+    ap.add_argument("--profile", action="store_true",
+                    help="print a per-phase timing breakdown on exit")
+    ap.add_argument("--no-pch", action="store_true",
+                    help="disable the precompiled-header fast path (compile full TU each time)")
+    ap.add_argument("--batch", type=int, default=16, metavar="K",
+                    help="candidates compiled per mwcc invocation, per worker "
+                         "(amortizes process startup; default 16, 1 to disable)")
+    args = ap.parse_args()
 
-    func_name = args.func_name
-    permute_fn_names = args.permute_fn_names
-    unit = find_unit_for_function(func_name)
+    fn = args.func_name
+    unit = find_unit_for_function(fn)
     if unit is None:
-        print(f"error: could not find function '{func_name}' in report.json", file=sys.stderr)
+        print(f"error: function '{fn}' not in report.json", file=sys.stderr)
         return 1
 
-    c_file = SRC_ROOT / f"{unit}.c"
-    asm_file = ROOT / "build/GALE01/asm" / f"{unit}.s"
-
+    c_file = ROOT / f"src/{unit}.c"
     if not c_file.exists():
-        print(f"error: C file not found: {c_file}", file=sys.stderr)
-        return 1
-    if not asm_file.exists():
-        print(f"error: assembly file not found: {asm_file}", file=sys.stderr)
+        print(f"error: source not found: {c_file}", file=sys.stderr)
         return 1
 
-    nonmatch_dir = NONMATCHINGS / func_name
-    permute_fns_file = nonmatch_dir / "permute_fns.txt"
+    mutate_fns = args.permute_fn_names or [fn]
+    base_source = c_file.read_bytes()
 
-    # Reimport if source is newer than the last import, or if the requested
-    # randomization set has changed.
-    if nonmatch_dir.exists() and not args.reimport:
-        base_c = nonmatch_dir / "base.c"
-        if base_c.exists() and c_file.stat().st_mtime > base_c.stat().st_mtime:
-            args.reimport = True
+    # Validate mutate targets exist in this TU, and build per-function mutators.
+    tree = src_mutate.parse(base_source)
+    mutators: Dict[str, src_mutate.Mutator] = {}
+    for mfn in mutate_fns:
+        if src_mutate.find_function(tree.root_node, mfn) is None:
+            print(f"error: function '{mfn}' not found in {c_file}", file=sys.stderr)
+            return 1
+        mutators[mfn] = src_mutate.Mutator(mfn)
+
+    # Baseline: compile the unmodified real source and score it.
+    scorer = make_scorer(unit, fn)
+    base_co = compile_source_text(unit, base_source.decode("utf-8", "surrogateescape"),
+                                  show_errors=True)
+    if base_co is None:
+        print("error: baseline source failed to compile", file=sys.stderr)
+        return 1
+    base_score, _ = scorer.score(str(base_co.obj))
+    base_pct = objdiff_percent(unit, fn, base_co.obj)
+    base_co.tmpdir.cleanup()
+
+    pstr = f" ({base_pct:.2f}%)" if base_pct is not None else ""
+    print(f"permuting {fn} in {unit}.c; mutating {', '.join(mutate_fns)}")
+    print(f"baseline score {base_score}{pstr}; {args.jobs} workers; "
+          f"apply={args.apply}")
+    if base_score == 0:
+        print("baseline already matches (score 0).")
+        return 0
+
+    # Precompiled-header fast path: precompile the TU's constant header/preproc
+    # prefix once, then recompile only the mutated body per candidate (~2x).
+    use_pch = False
+    split = 0
+    pch_path: Optional[Path] = None
+    if not args.no_pch:
+        split = src_mutate.prefix_split(base_source)
+        if 0 < split < len(base_source):
+            pch_path = build_pch(
+                unit, base_source[:split].decode("utf-8", "surrogateescape"), quiet=False)
+    if pch_path is not None:
+        # Fidelity gate: the PCH body compile must score identically to the full
+        # compile against the real target, or we fall back to full compiles.
+        body0 = base_source[split:].decode("utf-8", "surrogateescape")
+        pch_co = compile_source_text(unit, body0, prefix_pch=pch_path, show_errors=True)
+        pch_score = None
+        if pch_co is not None:
+            pch_score, _ = scorer.score(str(pch_co.obj))
+            pch_co.tmpdir.cleanup()
+        if pch_score == base_score:
+            use_pch = True
         else:
-            existing_permute: list = []
-            if permute_fns_file.exists():
-                existing_permute = [
-                    line.strip()
-                    for line in permute_fns_file.read_text().splitlines()
-                    if line.strip()
-                ]
-            if existing_permute != list(permute_fn_names):
-                args.reimport = True
+            print(f"PCH: disabled (fidelity gate pch={pch_score} vs full={base_score}); "
+                  "using full compiles")
+            pch_path.unlink(missing_ok=True)
+            pch_path = None
 
-    if args.reimport and nonmatch_dir.exists():
-        shutil.rmtree(nonmatch_dir)
-
-    if not nonmatch_dir.exists():
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(PERMUTER / "import.py"),
-                str(c_file),
-                str(asm_file),
-                "--function", func_name,
-                "--no-prune",
-                # Settings live at the harness root, not in the melee tree
-                # (find_root_dir still locates <melee> via build.ninja).
-                # Keeps the melee checkout copy-free.
-                "--settings", str(PERMUTER_SETTINGS),
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            sys.stdout.write(result.stdout)
-            sys.stderr.write(result.stderr)
-            return result.returncode
-
-    if permute_fn_names:
-        permute_fns_file.write_text("\n".join(permute_fn_names) + "\n")
-    elif permute_fns_file.exists():
-        permute_fns_file.unlink()
-
-    if not permuter_args:
-        permuter_args = ["-j8", "--better-only", "--stop-on-zero"]
-
-    # Compute the synthesized-TU baseline percent up front so we can print it
-    # alongside the disclaimer and pass it to the inner permuter (which uses
-    # it for the live counter's delta).
-    baseline = _objdiff_percent(
-        nonmatch_dir / "target.o", nonmatch_dir / "base.o", func_name
+    sh = Shared(
+        base_score=base_score, base_source=base_source, unit=unit, fn=fn,
+        keep_prob=args.keep_prob, max_iters=args.max_iters,
+        use_pch=use_pch, split=split, pch_path=pch_path, batch=max(1, args.batch),
     )
-    print(DISCLAIMER, flush=True)
-    if baseline is not None:
-        print(f"Baseline: {baseline:.2f}%", flush=True)
-        permuter_args = permuter_args + ["--baseline-percent", f"{baseline:.4f}"]
 
+    # Ctrl-C just asks the workers to stop. Handling SIGINT here (rather than
+    # relying on KeyboardInterrupt) keeps the whole shutdown path -- the join,
+    # the cleanup -- free of stray tracebacks. Worker subprocesses still receive
+    # the terminal's group SIGINT directly; worker() absorbs that.
+    prev_sigint = signal.signal(signal.SIGINT, lambda *_: sh.stop.set())
+
+    threads = [
+        threading.Thread(target=worker, args=(sh, mutators, mutate_fns,
+                                               args.seed * 1000 + i), daemon=True)
+        for i in range(args.jobs)
+    ]
+    for t in threads:
+        t.start()
+
+    start = time.time()
     try:
-        proc = subprocess.Popen(
-            [sys.executable, str(PERMUTER / "permuter.py"), str(nonmatch_dir)] + permuter_args,
-            cwd=ROOT,
-            start_new_session=True,
-        )
-        proc.wait(timeout=args.timeout)
-    except (KeyboardInterrupt, subprocess.TimeoutExpired):
-        # SIGINT (not SIGTERM) lets the workers raise KeyboardInterrupt and
-        # tear down multiprocessing semaphores cleanly. Fall back to SIGTERM
-        # if it doesn't exit promptly.
-        os.killpg(proc.pid, signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait()
+        while not sh.stop.is_set() and any(t.is_alive() for t in threads):
+            time.sleep(0.2)
+            with sh.lock:
+                it, bs, cf = sh.iters, sh.best_score, sh.compiles_failed
+            elapsed = time.time() - start
+            rate = it / elapsed if elapsed else 0.0
+            sys.stderr.write(
+                f"\r{int(elapsed)}s  iters={it} ({rate:.1f}/s)  "
+                f"best={bs}  compile-fail={cf}   ")
+            sys.stderr.flush()
+            if args.timeout is not None and elapsed >= args.timeout:
+                sh.stop.set()
+    finally:
+        # Keep the stop-setting handler installed through the join: a group
+        # SIGINT pending for the main thread must not fire the default handler
+        # (KeyboardInterrupt) while we're joining workers. Restore it last.
+        sh.stop.set()
+        for t in threads:
+            t.join(timeout=10)
+        signal.signal(signal.SIGINT, prev_sigint)
+        sys.stderr.write("\n")
+        if pch_path is not None:
+            pch_path.unlink(missing_ok=True)
 
-    show_best(nonmatch_dir, func_name, baseline)
-    shutil.rmtree(nonmatch_dir, ignore_errors=True)
+    if args.profile:
+        print_profile(sh, time.time() - start, args.jobs)
+
+    with sh.lock:
+        best_score, best_source = sh.best_score, sh.best_source
+    if best_source is None or best_score >= base_score:
+        print(f"no improvement (best {best_score}, baseline {base_score}).")
+        return 0
+
+    matched = best_score == 0
+    print(f"\nbest score {best_score} (baseline {base_score})"
+          + ("  -- 100% match!" if matched else ""))
+
+    do_apply = args.apply == "always" or (args.apply == "match" and matched)
+    if do_apply:
+        c_file.write_bytes(best_source)
+        print(f"applied best candidate to {c_file}")
+    else:
+        hint = "--apply=always" if matched else "--apply=always (partial)"
+        print(f"(not applied; re-run with {hint} to write to {c_file}, "
+              f"or use nonmatchings/{fn}/found-{best_score}.c)")
     return 0
 
 

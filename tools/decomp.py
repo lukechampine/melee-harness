@@ -39,11 +39,9 @@ from elftools.elf.sections import SymbolTableSection
 
 # Melee checkout root: explicit override, then Claude Code's project dir,
 # then assume this script lives at <melee>/tools/ (matches checkdiff.py etc.).
-ROOT = Path(
-    os.environ.get("MELEE_ROOT")
-    or os.environ.get("CLAUDE_PROJECT_DIR")
-    or Path(__file__).resolve().parents[1]
-)
+from melee_root import resolve_root
+
+ROOT = resolve_root()
 # The vendored m2c fork lives at the harness root, next to this tools/ dir.
 M2C_ROOT = Path(__file__).resolve().parents[1] / "m2c"
 DTK_ROOT = ROOT / "build/GALE01"

@@ -23,185 +23,27 @@ result:
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
-import shlex
 import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from objdiff_path import objdiff_cli
+from ninja_compile import (
+    CompiledObject,
+    direct_compile,
+    find_unit_for_function,
+)
 
 # Melee checkout root: explicit override, then Claude Code's project dir,
 # then assume this script lives at <melee>/tools/.
-ROOT = Path(
-    os.environ.get("MELEE_ROOT")
-    or os.environ.get("CLAUDE_PROJECT_DIR")
-    or Path(__file__).resolve().parents[1]
-)
-REPORT_PATH = ROOT / "build/GALE01/report.json"
+from melee_root import resolve_root
+
+ROOT = resolve_root()
 SRC_ROOT = ROOT / "src"
 # Sibling harness scripts live next to this one, not in the melee tree.
 TOOLS = Path(__file__).resolve().parent
-
-
-@dataclass
-class BuildBlock:
-    rule: str
-    src: str
-    mw_version: str
-    cflags: str
-    extab_padding: Optional[str] = None
-
-
-@dataclass
-class CompiledObject:
-    obj: Path
-    tmpdir: tempfile.TemporaryDirectory
-
-
-def find_unit_for_function(func_name: str) -> Optional[str]:
-    with REPORT_PATH.open("r") as f:
-        for unit in json.load(f).get("units", []):
-            for function in unit.get("functions", []):
-                if function.get("name") == func_name:
-                    return unit.get("name", "").removeprefix("main/")
-    return None
-
-
-def find_build_block(obj_path: str) -> BuildBlock:
-    """Parse build.ninja for the MWCC build edge that produces obj_path."""
-    target = f"build/GALE01/src/{obj_path}.o"
-    text = (ROOT / "build.ninja").read_text()
-    # Unfold ninja line continuations so cflags can be read as one value.
-    text = text.replace("$\n", " ")
-
-    blocks = re.split(r"^build ", text, flags=re.M)
-    for block in blocks:
-        if not (block.startswith(f"{target}:") or block.startswith(f"{target} :")):
-            continue
-
-        build_line = block.splitlines()[0]
-        match = re.match(rf"{re.escape(target)}\s*:\s*(\S+)\s+(.+)", build_line)
-        if match is None:
-            raise RuntimeError(f"could not parse build edge for {target}")
-
-        rule = match.group(1)
-        explicit_inputs = re.split(r"\s+\|\|?\s+", match.group(2), maxsplit=1)[0]
-        inputs = shlex.split(explicit_inputs)
-        if not inputs:
-            raise RuntimeError(f"build edge for {target} has no source input")
-
-        vars = {
-            m.group(1): m.group(2).strip()
-            for m in re.finditer(r"^\s+([A-Za-z_][A-Za-z0-9_]*) = (.*)$", block, re.M)
-        }
-        try:
-            mw_version = vars["mw_version"]
-            cflags = vars["cflags"]
-        except KeyError as e:
-            raise RuntimeError(f"build edge for {target} is missing {e.args[0]}") from e
-
-        return BuildBlock(
-            rule=rule,
-            src=inputs[0],
-            mw_version=mw_version,
-            cflags=cflags,
-            extab_padding=vars.get("extab_padding"),
-        )
-
-    raise RuntimeError(f"no build edge for {target}")
-
-
-def direct_compile(obj_path: str) -> Optional[CompiledObject]:
-    """Compile one TU directly from its build.ninja MWCC settings.
-
-    The output goes to a unique temporary object, avoiding Ninja state and the
-    normal build-tree object path.
-    """
-    try:
-        block = find_build_block(obj_path)
-    except RuntimeError as e:
-        print(f"build.ninja lookup failed: {e}", file=sys.stderr)
-        return None
-
-    mwcc_rules = {"mwcc", "mwcc_sjis", "mwcc_extab", "mwcc_sjis_extab"}
-    if block.rule not in mwcc_rules:
-        print(f"unsupported build rule for direct compile: {block.rule}", file=sys.stderr)
-        return None
-
-    wibo = ROOT / "build/tools/wibo"
-    sjiswrap = ROOT / "build/tools/sjiswrap.exe"
-    dtk = ROOT / "build/tools/dtk"
-    compiler = ROOT / "build" / "compilers" / block.mw_version / "mwcceppc.exe"
-
-    required = [wibo, compiler]
-    if "sjis" in block.rule:
-        required.append(sjiswrap)
-    if "extab" in block.rule:
-        required.append(dtk)
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        print("missing build prerequisite(s):", file=sys.stderr)
-        for path in missing:
-            print(f"  {path}", file=sys.stderr)
-        print("run `ninja tools` once to fetch/build prerequisites", file=sys.stderr)
-        return None
-
-    build_tmp = ROOT / "build"
-    build_tmp.mkdir(exist_ok=True)
-    tmpdir = tempfile.TemporaryDirectory(prefix="checkdiff-", dir=build_tmp)
-    tmp_obj = Path(tmpdir.name) / f"{Path(obj_path).name}.o"
-
-    cmd = [str(wibo)]
-    if "sjis" in block.rule:
-        cmd.append(str(sjiswrap))
-    cmd += [
-        str(compiler),
-        *shlex.split(block.cflags),
-        "-c",
-        block.src,
-        "-o",
-        str(tmp_obj),
-    ]
-
-    result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    if result.returncode != 0:
-        print("direct compile failed:", file=sys.stderr)
-        print(result.stdout)
-        print(result.stderr, file=sys.stderr)
-        tmpdir.cleanup()
-        return None
-
-    if not tmp_obj.exists():
-        objs = list(Path(tmpdir.name).glob("*.o"))
-        if len(objs) == 1:
-            tmp_obj = objs[0]
-        else:
-            print(f"direct compile did not produce {tmp_obj}", file=sys.stderr)
-            tmpdir.cleanup()
-            return None
-
-    if "extab" in block.rule:
-        padding = block.extab_padding or ""
-        result = subprocess.run(
-            [str(dtk), "extab", "clean", "--padding", padding, str(tmp_obj), str(tmp_obj)],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            print("extab post-processing failed:", file=sys.stderr)
-            print(result.stdout)
-            print(result.stderr, file=sys.stderr)
-            tmpdir.cleanup()
-            return None
-
-    return CompiledObject(obj=tmp_obj, tmpdir=tmpdir)
 
 
 def auto_fix_frame(func_name: str) -> None:

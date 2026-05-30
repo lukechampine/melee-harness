@@ -28,11 +28,9 @@ from pathlib import Path
 
 # Melee checkout root: explicit override, then Claude Code's project dir,
 # then assume this script lives at <melee>/tools/.
-ROOT = Path(
-    os.environ.get("MELEE_ROOT")
-    or os.environ.get("CLAUDE_PROJECT_DIR")
-    or Path(__file__).resolve().parents[1]
-)
+from melee_root import resolve_root
+
+ROOT = resolve_root()
 DEFAULT_ASM = ROOT / "build" / "GALE01" / "asm"
 
 INSN_RE = re.compile(r"^/\*[^*]*\*/\s+(\S+)\s*(.*?)\s*$")
