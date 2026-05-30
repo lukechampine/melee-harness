@@ -658,17 +658,13 @@ def _inline_byval_unsafe(n: Node, ftypes: dict) -> bool:
     return False
 
 
-def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
-    """Extract a pure value subexpression into a `static inline` helper at file
-    scope and replace it with a call -- recreating the helper-shaped units mwcc
-    was originally fed (it inlines them back, but allocates registers across the
-    boundary differently). Free variables become parameters (named the same, so
-    the body is `return <expr>;` verbatim); globals/functions are referenced
-    directly. Needs types, so it only fires on base steps."""
+def _expr_inline_sites(ctx: Ctx):
+    """Yield (start, end, helper_bytes, call_bytes) for every value subexpression
+    extractable into a `static inline` value helper."""
     if ctx.types is None:
-        return None
+        return
     locals_ = _local_names(ctx.fn)
-    cands = []
+    fname = fn_name_of(ctx.fn) or "fn"
     for n in iter_subtree(ctx.fn):
         if n.type not in TEMP_EXPR_TYPES:
             continue
@@ -691,29 +687,34 @@ def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
         ftypes: dict = {}
         ok = True
         for nm in order:
-            t = next((ctx.types.get((i.start_byte, i.end_byte)) for i in occ[nm]
-                      if ctx.types.get((i.start_byte, i.end_byte))), None)
+            t = _occ_type(occ[nm], ctx.types)
             if not t or not _usable_temp_type(t):
                 ok = False
                 break
             ftypes[nm] = t
         if not ok or _inline_byval_unsafe(n, ftypes):
             continue
-        cands.append((n, typ, order, ftypes))
-    if not cands:
+        hid = f"{fname}_pi{n.start_byte}".encode()
+        params = (b"void" if not order else
+                  b", ".join(ftypes[nm].encode() + b" " + nm.encode() for nm in order))
+        args = b", ".join(nm.encode() for nm in order)
+        helper = (b"static inline " + typ.encode() + b" " + hid + b"(" + params + b")\n{\n"
+                  + b"    return " + n.text + b";\n}\n\n")
+        yield (n.start_byte, n.end_byte, helper, hid + b"(" + args + b")")
+
+
+def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
+    """Extract a pure value subexpression into a `static inline` helper at file
+    scope and replace it with a call -- recreating the helper-shaped units mwcc
+    was originally fed (it inlines them back, but allocates registers across the
+    boundary differently). Free variables become parameters (named the same, so
+    the body is `return <expr>;` verbatim); globals/functions are referenced
+    directly. Needs types, so it only fires on base steps."""
+    sites = list(_expr_inline_sites(ctx))
+    if not sites:
         return None
-    n, typ, order, ftypes = ctx.rng.choice(cands)
-    fname = fn_name_of(ctx.fn) or "fn"
-    hid = f"{fname}_pi{n.start_byte}".encode()
-    params = (b"void" if not order else
-              b", ".join(ftypes[nm].encode() + b" " + nm.encode() for nm in order))
-    args = b", ".join(nm.encode() for nm in order)
-    helper = (b"static inline " + typ.encode() + b" " + hid + b"(" + params + b")\n{\n"
-              + b"    return " + n.text + b";\n}\n\n")
-    return [
-        (ctx.fn.start_byte, ctx.fn.start_byte, helper),
-        (n.start_byte, n.end_byte, hid + b"(" + args + b")"),
-    ]
+    s, e, helper, call = ctx.rng.choice(sites)
+    return [(ctx.fn.start_byte, ctx.fn.start_byte, helper), (s, e, call)]
 
 
 def _storage_base(lv: Optional[Node]) -> Optional[str]:
@@ -761,27 +762,10 @@ def _jump_escapes_run(jump: Node, run_start: int, run_end: int) -> bool:
     return True
 
 
-def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
-    """Extract a contiguous run of statements into a `static inline void` helper
-    -- the `it_NNNN_inline_N(gobj, arg1, &pos)` shape. Reads of outer locals
-    become by-value params; non-pointer locals whose storage the run writes
-    become pointer out-params (uses rewritten to `(*v)`, call passes `&v`);
-    nested declarations stay helper-local; globals/functions are referenced
-    directly. Needs types -> base steps only."""
-    if ctx.types is None:
-        return None
-    body = body_of(ctx.fn)
-    if body is None:
-        return None
-    stmts = [c for c in body.named_children if c.type in STMT_TYPES]
-    if not stmts:
-        return None
-    locals_ = _local_names(ctx.fn)
-    i = ctx.rng.randrange(len(stmts))
-    j = min(len(stmts) - 1, i + ctx.rng.randrange(5))   # run of 1..5 statements
-    run = stmts[i:j + 1]
+def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str):
+    """Build (start, end, helper_bytes, call_bytes) for extracting `run` into a
+    `static inline void` helper, or None if it can't be cleanly extracted."""
     run_start, run_end = run[0].start_byte, run[-1].end_byte
-
     decl_inside: set = set()
     occ: dict = {}
     order: List[str] = []
@@ -807,10 +791,8 @@ def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
                     occ.setdefault(nm, []).append(m)
                     if nm not in order:
                         order.append(nm)
-    # drop occurrences of names also declared inside the run (helper-local)
     order = [nm for nm in order if nm not in decl_inside]
 
-    # outer non-pointer locals whose storage the run modifies -> out-params
     out: set = set()
     for s in run:
         for m in iter_subtree(s):
@@ -837,12 +819,11 @@ def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
         if not t or not _usable_temp_type(t):
             return None
         ptypes[nm] = t
-    in_params = [nm for nm in order if nm not in out]
-    out_params = [nm for nm in order if nm in out]
     if len(order) > 6:
         return None
+    in_params = [nm for nm in order if nm not in out]
+    out_params = [nm for nm in order if nm in out]
 
-    fname = fn_name_of(ctx.fn) or "fn"
     hid = f"{fname}_blk{run_start}".encode()
     decls = [ptypes[nm].encode() + b" " + nm.encode() for nm in in_params]
     decls += [ptypes[nm].encode() + b" *" + nm.encode() for nm in out_params]
@@ -860,16 +841,73 @@ def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
 
     helper = (b"static inline void " + hid + b"(" + params + b")\n{\n    "
               + bytes(body_text) + b"\n}\n\n")
-    return [
-        (ctx.fn.start_byte, ctx.fn.start_byte, helper),
-        (run_start, run_end, hid + b"(" + b", ".join(args) + b");"),
-    ]
+    return (run_start, run_end, helper, hid + b"(" + b", ".join(args) + b");")
+
+
+def _block_inline_sites(ctx: Ctx):
+    """Yield a site for every contiguous run of 1..5 top-level statements."""
+    if ctx.types is None:
+        return
+    body = body_of(ctx.fn)
+    if body is None:
+        return
+    stmts = [c for c in body.named_children if c.type in STMT_TYPES]
+    locals_ = _local_names(ctx.fn)
+    fname = fn_name_of(ctx.fn) or "fn"
+    for i in range(len(stmts)):
+        for j in range(i, min(len(stmts), i + 5)):
+            site = _block_site(ctx, stmts[i:j + 1], locals_, fname)
+            if site is not None:
+                yield site
+
+
+def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
+    """Extract a contiguous run of statements into a `static inline void` helper
+    -- the `it_NNNN_inline_N(gobj, arg1, &pos)` shape. Reads of outer locals
+    become by-value params; non-pointer locals whose storage the run writes
+    become pointer out-params (uses rewritten to `(*v)`, call passes `&v`);
+    nested declarations stay helper-local. Needs types -> base steps only."""
+    sites = list(_block_inline_sites(ctx))
+    if not sites:
+        return None
+    s, e, helper, call = ctx.rng.choice(sites)
+    return [(ctx.fn.start_byte, ctx.fn.start_byte, helper), (s, e, call)]
+
+
+def p_multi_inline(ctx: Ctx) -> Optional[List[Edit]]:
+    """Apply several non-overlapping inline extractions in one candidate -- the
+    lever for functions that need multiple coordinated helpers at once. Every
+    site is computed from the same (base) source, so combining them is just
+    concatenating disjoint edits: K helper defs (all inserted at the function
+    start, where they concatenate) plus K in-place call replacements."""
+    sites = list(_expr_inline_sites(ctx)) + list(_block_inline_sites(ctx))
+    if len(sites) < 2:
+        return None
+    ctx.rng.shuffle(sites)
+    chosen: List[Tuple[int, int, bytes, bytes]] = []
+    occupied: List[Tuple[int, int]] = []
+    k = ctx.rng.randint(2, min(5, len(sites)))
+    for s, e, helper, call in sites:
+        if any(not (e <= a or s >= b) for a, b in occupied):
+            continue   # overlaps an already-chosen site
+        chosen.append((s, e, helper, call))
+        occupied.append((s, e))
+        if len(chosen) >= k:
+            break
+    if len(chosen) < 2:
+        return None
+    edits: List[Edit] = []
+    for s, e, helper, call in chosen:
+        edits.append((ctx.fn.start_byte, ctx.fn.start_byte, helper))
+        edits.append((s, e, call))
+    return edits
 
 
 PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("temp_for_expr", p_temp_for_expr, 16.0),
     ("inline", p_inline, 12.0),
     ("inline_block", p_inline_block, 12.0),
+    ("multi_inline", p_multi_inline, 10.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
     ("reorder_params", p_reorder_params, 6.0),
