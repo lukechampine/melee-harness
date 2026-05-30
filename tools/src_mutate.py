@@ -549,8 +549,176 @@ def p_temp_for_expr(ctx: Ctx) -> Optional[List[Edit]]:
     return [(s0, s1, block)]
 
 
+def _declared_name(node: Node) -> Optional[str]:
+    """Identifier a declarator/parameter introduces (descends pointer/array/etc.)."""
+    d = field(node, "declarator") or node
+    while d is not None:
+        if d.type == "identifier":
+            return d.text.decode()
+        d = field(d, "declarator")
+    return None
+
+
+def _local_names(fn: Node) -> set:
+    """Names declared in `fn`: its parameters and its body's local declarations.
+    An identifier referencing one of these is a free variable that must become a
+    helper parameter; anything else (global, function, enum, macro) the helper
+    can reference directly."""
+    names: set = set()
+    fdecl = function_declarator_of(fn)
+    if fdecl is not None:
+        pl = field(fdecl, "parameters")
+        if pl is not None:
+            for p in pl.named_children:
+                if p.type == "parameter_declaration":
+                    nm = _declared_name(p)
+                    if nm:
+                        names.add(nm)
+    for n in iter_subtree(fn):
+        if n.type != "declaration":
+            continue
+        typ = field(n, "type")
+        for c in n.named_children:
+            if typ is not None and (c.start_byte, c.end_byte) == (typ.start_byte, typ.end_byte):
+                continue
+            nm = _declared_name(c)
+            if nm:
+                names.add(nm)
+    return names
+
+
+def _expr_base_id(e: Optional[Node]) -> Optional[Node]:
+    """Leftmost identifier an lvalue is rooted at (through ->/.//[]/(*)/casts)."""
+    cur = e
+    while cur is not None:
+        t = cur.type
+        if t == "identifier":
+            return cur
+        if t == "field_expression":
+            cur = field(cur, "argument")
+        elif t == "subscript_expression":
+            cur = field(cur, "argument") or only_named(cur)
+        elif t in ("parenthesized_expression", "pointer_expression"):
+            cur = field(cur, "argument") or only_named(cur)
+        elif t == "cast_expression":
+            cur = field(cur, "value")
+        else:
+            return None
+    return None
+
+
+def _inline_pos_ok(n: Node) -> bool:
+    """Can `n` be replaced in place by a call rvalue? Not if it's an lvalue being
+    assigned, addressed, incremented, or used as a call's callee."""
+    par = n.parent
+    if par is None:
+        return True
+    if par.type == "expression_statement":
+        return False   # discarded value -- pointless, and catches statement-macros
+    if par.type == "assignment_expression":
+        l = field(par, "left")
+        if l is not None and (l.start_byte, l.end_byte) == (n.start_byte, n.end_byte):
+            return False
+    if par.type == "update_expression":
+        return False
+    if par.type == "pointer_expression":
+        op = field(par, "operator")
+        if op is not None and op.text == b"&":
+            return False
+    if par.type == "call_expression":
+        f = field(par, "function")
+        if f is not None and (f.start_byte, f.end_byte) == (n.start_byte, n.end_byte):
+            return False
+    return True
+
+
+def _inline_byval_unsafe(n: Node, ftypes: dict) -> bool:
+    """Free vars are passed by value, so writing to / taking the address of a
+    *non-pointer* free var inside the expr would be lost. (Writes/addresses
+    through a pointer free var are fine -- same pointee.)"""
+    def base_nonptr_free(lv: Optional[Node]) -> bool:
+        b = _expr_base_id(lv)
+        if b is None:
+            return False
+        nm = b.text.decode()
+        return nm in ftypes and not ftypes[nm].rstrip().endswith("*")
+
+    for m in iter_subtree(n):
+        if m.type == "assignment_expression":
+            if base_nonptr_free(field(m, "left")):
+                return True
+        elif m.type == "update_expression":
+            if base_nonptr_free(field(m, "argument") or only_named(m)):
+                return True
+        elif m.type == "pointer_expression":
+            op = field(m, "operator")
+            if op is not None and op.text == b"&" and base_nonptr_free(
+                    field(m, "argument") or only_named(m)):
+                return True
+    return False
+
+
+def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
+    """Extract a pure value subexpression into a `static inline` helper at file
+    scope and replace it with a call -- recreating the helper-shaped units mwcc
+    was originally fed (it inlines them back, but allocates registers across the
+    boundary differently). Free variables become parameters (named the same, so
+    the body is `return <expr>;` verbatim); globals/functions are referenced
+    directly. Needs types, so it only fires on base steps."""
+    if ctx.types is None:
+        return None
+    locals_ = _local_names(ctx.fn)
+    cands = []
+    for n in iter_subtree(ctx.fn):
+        if n.type not in TEMP_EXPR_TYPES:
+            continue
+        typ = ctx.types.get((n.start_byte, n.end_byte))
+        if typ is None or not _usable_temp_type(typ) or not _inline_pos_ok(n):
+            continue
+        order: List[str] = []
+        occ: dict = {}
+        for idn in iter_subtree(n):
+            if idn.type != "identifier":
+                continue
+            nm = idn.text.decode()
+            if nm not in locals_:
+                continue
+            occ.setdefault(nm, []).append(idn)
+            if nm not in order:
+                order.append(nm)
+        if len(order) > 6:
+            continue
+        ftypes: dict = {}
+        ok = True
+        for nm in order:
+            t = next((ctx.types.get((i.start_byte, i.end_byte)) for i in occ[nm]
+                      if ctx.types.get((i.start_byte, i.end_byte))), None)
+            if not t or not _usable_temp_type(t):
+                ok = False
+                break
+            ftypes[nm] = t
+        if not ok or _inline_byval_unsafe(n, ftypes):
+            continue
+        cands.append((n, typ, order, ftypes))
+    if not cands:
+        return None
+    n, typ, order, ftypes = ctx.rng.choice(cands)
+    fname = fn_name_of(ctx.fn) or "fn"
+    hid = f"{fname}_pi{n.start_byte}".encode()
+    params = (b"void" if not order else
+              b", ".join(ftypes[nm].encode() + b" " + nm.encode() for nm in order))
+    args = b", ".join(nm.encode() for nm in order)
+    helper = (b"static inline " + typ.encode() + b" " + hid + b"(" + params + b")\n{\n"
+              + b"    return " + n.text + b";\n}\n\n")
+    return [
+        (ctx.fn.start_byte, ctx.fn.start_byte, helper),
+        (n.start_byte, n.end_byte, hid + b"(" + args + b")"),
+    ]
+
+
 PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("temp_for_expr", p_temp_for_expr, 16.0),
+    ("inline", p_inline, 12.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
     ("reorder_params", p_reorder_params, 6.0),
