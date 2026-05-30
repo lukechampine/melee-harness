@@ -716,9 +716,160 @@ def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
     ]
 
 
+def _storage_base(lv: Optional[Node]) -> Optional[str]:
+    """Variable whose own storage a write to `lv` modifies, or None if the path
+    dereferences a pointer (-> or *) -- then a pointee changes, not a local."""
+    cur = lv
+    while cur is not None:
+        t = cur.type
+        if t == "identifier":
+            return cur.text.decode()
+        if t == "field_expression":
+            op = field(cur, "operator")
+            if op is not None and op.text == b"->":
+                return None
+            cur = field(cur, "argument")
+        elif t in ("parenthesized_expression", "subscript_expression"):
+            cur = field(cur, "argument") or only_named(cur)
+        elif t == "pointer_expression":   # (*p) = ...
+            return None
+        elif t == "cast_expression":
+            cur = field(cur, "value")
+        else:
+            return None
+    return None
+
+
+def _occ_type(nodes: List[Node], types: dict) -> Optional[str]:
+    for n in nodes:
+        t = types.get((n.start_byte, n.end_byte))
+        if t:
+            return t
+    return None
+
+
+def _jump_escapes_run(jump: Node, run_start: int, run_end: int) -> bool:
+    """A break/continue is fine only if its target loop/switch is inside the run."""
+    targets = {"for_statement", "while_statement", "do_statement"}
+    if jump.type == "break_statement":
+        targets = targets | {"switch_statement"}
+    p = jump.parent
+    while p is not None:
+        if p.type in targets:
+            return not (run_start <= p.start_byte and p.end_byte <= run_end)
+        p = p.parent
+    return True
+
+
+def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
+    """Extract a contiguous run of statements into a `static inline void` helper
+    -- the `it_NNNN_inline_N(gobj, arg1, &pos)` shape. Reads of outer locals
+    become by-value params; non-pointer locals whose storage the run writes
+    become pointer out-params (uses rewritten to `(*v)`, call passes `&v`);
+    nested declarations stay helper-local; globals/functions are referenced
+    directly. Needs types -> base steps only."""
+    if ctx.types is None:
+        return None
+    body = body_of(ctx.fn)
+    if body is None:
+        return None
+    stmts = [c for c in body.named_children if c.type in STMT_TYPES]
+    if not stmts:
+        return None
+    locals_ = _local_names(ctx.fn)
+    i = ctx.rng.randrange(len(stmts))
+    j = min(len(stmts) - 1, i + ctx.rng.randrange(5))   # run of 1..5 statements
+    run = stmts[i:j + 1]
+    run_start, run_end = run[0].start_byte, run[-1].end_byte
+
+    decl_inside: set = set()
+    occ: dict = {}
+    order: List[str] = []
+    for s in run:
+        for m in iter_subtree(s):
+            t = m.type
+            if t in ("return_statement", "goto_statement"):
+                return None
+            if t in ("break_statement", "continue_statement") and \
+                    _jump_escapes_run(m, run_start, run_end):
+                return None
+            if t == "declaration":
+                ty = field(m, "type")
+                for c in m.named_children:
+                    if ty is not None and (c.start_byte, c.end_byte) == (ty.start_byte, ty.end_byte):
+                        continue
+                    nm = _declared_name(c)
+                    if nm:
+                        decl_inside.add(nm)
+            elif t == "identifier":
+                nm = m.text.decode()
+                if nm in locals_:
+                    occ.setdefault(nm, []).append(m)
+                    if nm not in order:
+                        order.append(nm)
+    # drop occurrences of names also declared inside the run (helper-local)
+    order = [nm for nm in order if nm not in decl_inside]
+
+    # outer non-pointer locals whose storage the run modifies -> out-params
+    out: set = set()
+    for s in run:
+        for m in iter_subtree(s):
+            lv = None
+            if m.type == "assignment_expression":
+                lv = field(m, "left")
+            elif m.type == "update_expression":
+                lv = field(m, "argument") or only_named(m)
+            elif m.type == "pointer_expression":
+                op = field(m, "operator")
+                if op is not None and op.text == b"&":
+                    lv = field(m, "argument") or only_named(m)
+            if lv is None:
+                continue
+            base = _storage_base(lv)
+            if base in order:
+                t = _occ_type(occ[base], ctx.types)
+                if t and not t.rstrip().endswith("*"):
+                    out.add(base)
+
+    ptypes: dict = {}
+    for nm in order:
+        t = _occ_type(occ[nm], ctx.types)
+        if not t or not _usable_temp_type(t):
+            return None
+        ptypes[nm] = t
+    in_params = [nm for nm in order if nm not in out]
+    out_params = [nm for nm in order if nm in out]
+    if len(order) > 6:
+        return None
+
+    fname = fn_name_of(ctx.fn) or "fn"
+    hid = f"{fname}_blk{run_start}".encode()
+    decls = [ptypes[nm].encode() + b" " + nm.encode() for nm in in_params]
+    decls += [ptypes[nm].encode() + b" *" + nm.encode() for nm in out_params]
+    params = b", ".join(decls) if decls else b"void"
+    args = [nm.encode() for nm in in_params] + [b"&" + nm.encode() for nm in out_params]
+
+    body_text = bytearray(ctx.src[run_start:run_end])
+    derefs: List[Edit] = []
+    for nm in out_params:
+        for node in occ[nm]:
+            derefs.append((node.start_byte - run_start, node.end_byte - run_start,
+                           b"(*" + nm.encode() + b")"))
+    for s0, e0, rep in sorted(derefs, key=lambda x: x[0], reverse=True):
+        body_text[s0:e0] = rep
+
+    helper = (b"static inline void " + hid + b"(" + params + b")\n{\n    "
+              + bytes(body_text) + b"\n}\n\n")
+    return [
+        (ctx.fn.start_byte, ctx.fn.start_byte, helper),
+        (run_start, run_end, hid + b"(" + b", ".join(args) + b");"),
+    ]
+
+
 PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("temp_for_expr", p_temp_for_expr, 16.0),
     ("inline", p_inline, 12.0),
+    ("inline_block", p_inline_block, 12.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
     ("reorder_params", p_reorder_params, 6.0),
