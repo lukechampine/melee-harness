@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tree-sitter", "tree-sitter-c"]
+# dependencies = ["tree-sitter", "tree-sitter-c", "libclang"]
 # ///
 """
 Source-level permuter for melee. Unlike the vendored decomp-permuter (which
@@ -56,6 +56,7 @@ _HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HARNESS / "tools"))            # for sibling modules
 
 import src_mutate  # noqa: E402
+import type_oracle  # noqa: E402
 from ninja_compile import (  # noqa: E402
     ROOT,
     build_pch,
@@ -127,6 +128,7 @@ class Shared:
     use_pch: bool = False
     split: int = 0
     pch_path: Optional[Path] = None
+    types: Optional[dict] = None   # clang type oracle (base spans -> type)
     batch: int = 8
     lock: threading.Lock = field(default_factory=threading.Lock)
     stop: threading.Event = field(default_factory=threading.Event)
@@ -194,7 +196,7 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
     }
     cur = sh.base_source
     tm = tc = ts = 0.0          # per-thread phase timers (merged at exit)
-    n_none = n_dup = 0
+    n_none = 0
     try:
         while not sh.stop.is_set():
             # --- build a batch of distinct, compilable-looking candidates ---
@@ -207,7 +209,8 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                     cur = sh.base_source
                 mfn = rng.choice(mutate_fns)
                 if cur is sh.base_source:
-                    cand = mutators[mfn].step(cur, rng, tree=base_tree, fn=base_fns[mfn])
+                    cand = mutators[mfn].step(cur, rng, tree=base_tree,
+                                              fn=base_fns[mfn], types=sh.types)
                 else:
                     cand = mutators[mfn].step(cur, rng)
                 if cand is None:
@@ -218,10 +221,11 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                 h = hashlib.sha256(cand).digest()
                 with sh.lock:
                     dup = h in sh.seen_source
-                    if not dup and len(sh.seen_source) < 200_000:
+                    if dup:
+                        sh.n_dup += 1   # live, for the status line (free: lock held)
+                    elif len(sh.seen_source) < 200_000:
                         sh.seen_source.add(h)
                 if dup:
-                    n_dup += 1
                     continue
                 cands.append(cand)
             tm += time.perf_counter() - t0
@@ -288,7 +292,6 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
             sh.prof_compile += tc
             sh.prof_score += ts
             sh.n_mutate_none += n_none
-            sh.n_dup += n_dup
 
 
 def main() -> int:
@@ -383,10 +386,22 @@ def main() -> int:
             pch_path.unlink(missing_ok=True)
             pch_path = None
 
+    # Type oracle (clang): expression types so temp_for_expr can extract
+    # subexpressions into typed temporaries. One clang parse of the base TU at
+    # startup; passes then just look up spans. Auto-disables (permuter still
+    # runs, minus temp_for_expr) if libclang / compile_commands are unavailable.
+    types: dict = {}
+    flags = type_oracle.clang_flags_for(c_file, ROOT / "compile_commands.json")
+    if type_oracle.available() and flags is not None:
+        types = type_oracle.build_oracle(c_file, flags)
+    print(f"type oracle: {len(types)} expression types"
+          if types else "type oracle: unavailable; temp_for_expr disabled")
+
     sh = Shared(
         base_score=base_score, base_source=base_source, unit=unit, fn=fn,
         keep_prob=args.keep_prob, max_iters=args.max_iters,
-        use_pch=use_pch, split=split, pch_path=pch_path, batch=max(1, args.batch),
+        use_pch=use_pch, split=split, pch_path=pch_path, types=types,
+        batch=max(1, args.batch),
     )
 
     # Ctrl-C just asks the workers to stop. Handling SIGINT here (rather than
@@ -408,12 +423,14 @@ def main() -> int:
         while not sh.stop.is_set() and any(t.is_alive() for t in threads):
             time.sleep(0.2)
             with sh.lock:
-                it, bs, cf = sh.iters, sh.best_score, sh.compiles_failed
+                it, bs, cf, nd = sh.iters, sh.best_score, sh.compiles_failed, sh.n_dup
             elapsed = time.time() - start
             rate = it / elapsed if elapsed else 0.0
+            total = nd + it + cf
+            dup_pct = (nd / total * 100) if total else 0.0
             sys.stderr.write(
                 f"\r{int(elapsed)}s  iters={it} ({rate:.1f}/s)  "
-                f"best={bs}  compile-fail={cf}   ")
+                f"best={bs}  dup={dup_pct:.0f}%  compile-fail={cf}   ")
             sys.stderr.flush()
             if args.timeout is not None and elapsed >= args.timeout:
                 sh.stop.set()

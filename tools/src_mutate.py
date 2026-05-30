@@ -175,6 +175,7 @@ class Ctx:
     root: Node
     fn: Node
     rng: random.Random
+    types: Optional[dict] = None   # {(start,end): clang type spelling}, base only
 
 
 def _pick_pair(rng: random.Random, n: int, adjacent_prob: float) -> Tuple[int, int]:
@@ -418,7 +419,121 @@ def p_reorder_params(ctx: Ctx) -> Optional[List[Edit]]:
     return edits
 
 
+TEMP_EXPR_TYPES = {
+    "binary_expression", "call_expression", "field_expression",
+    "cast_expression", "subscript_expression", "unary_expression",
+    "pointer_expression",
+}
+
+
+def _usable_temp_type(typ: str) -> bool:
+    # Skip types we can't write as `T name` cleanly: void, functions / function
+    # pointers, arrays, anonymous/unnamed aggregates.
+    if not typ or typ == "void":
+        return False
+    return not any(c in typ for c in "([{")
+
+
+def _enclosing_temp_stmt(n: Node):
+    """Nearest statement ancestor + how to host the temp there:
+      "wrap" -- expression_statement / return_statement: wrap in a block
+                `{ T tmp = expr; <stmt> }` (scope-safe, C89-legal).
+      "decl" -- single-declarator declaration: insert a sibling temp
+                declaration just before it (stays in the C89 decl zone, no
+                scope leak). Multi-declarator is skipped (the init could
+                reference an earlier declarator in the same statement).
+    Returns (stmt, mode) or (None, None). if/loop conditions are left for later.
+    """
+    p = n.parent
+    while p is not None:
+        if p.type == "declaration":
+            # only a block-level (not for-init), single-declarator declaration:
+            # insert a sibling temp decl before it, in the C89 decl zone.
+            if p.parent is not None and p.parent.type == "compound_statement":
+                inits = [c for c in p.named_children if c.type == "init_declarator"]
+                if len(inits) == 1:
+                    return p, "decl"
+            return None, None
+        if p.type in STMT_TYPES:
+            if p.type in ("expression_statement", "return_statement"):
+                return p, "wrap"
+            return None, None
+        p = p.parent
+    return None, None
+
+
+def _extract_unsafe(n: Node, stmt: Node) -> bool:
+    """True if hoisting `n`'s evaluation to the top of the statement could change
+    behaviour: it's an lvalue, a call's callee, or evaluated conditionally
+    (short-circuit / ternary / sizeof)."""
+    def _same(a: Optional[Node]) -> bool:  # tree-sitter returns fresh wrappers
+        return a is not None and a.start_byte == n.start_byte and a.end_byte == n.end_byte
+    par = n.parent
+    if par is not None:
+        if par.type == "assignment_expression" and _same(field(par, "left")):
+            return True
+        if par.type == "call_expression" and _same(field(par, "function")):
+            return True
+    p = n
+    while p is not None and p is not stmt:
+        anc = p.parent
+        if anc is None:
+            break
+        if anc.type in ("conditional_expression", "sizeof_expression"):
+            return True
+        if anc.type == "binary_expression":
+            op = field(anc, "operator")
+            if op is not None and op.text in (b"&&", b"||"):
+                return True
+        p = anc
+    return False
+
+
+def p_temp_for_expr(ctx: Ctx) -> Optional[List[Edit]]:
+    """Extract a value subexpression into a temporary -- the workhorse for
+    shifting register allocation. Needs the type (from the clang oracle), so it
+    only fires on base-source steps. Emits, in place of the statement:
+        { T tmp = <expr>; <statement with expr replaced by tmp> }
+    """
+    if ctx.types is None:
+        return None
+    cands = []
+    for n in iter_subtree(ctx.fn):
+        if n.type not in TEMP_EXPR_TYPES:
+            continue
+        typ = ctx.types.get((n.start_byte, n.end_byte))
+        if typ is None or not _usable_temp_type(typ):
+            continue
+        stmt, mode = _enclosing_temp_stmt(n)
+        if stmt is None or _extract_unsafe(n, stmt):
+            continue
+        cands.append((n, typ, stmt, mode))
+    if not cands:
+        return None
+    n, typ, stmt, mode = ctx.rng.choice(cands)
+    name = b"tmp_p%d" % n.start_byte          # deterministic -> dedups cleanly
+    decl = typ.encode() + b" " + name + b" = " + n.text + b";"
+    indent = ctx.src[ctx.src.rfind(b"\n", 0, stmt.start_byte) + 1:stmt.start_byte]
+
+    if mode == "decl":
+        # insert a sibling declaration before stmt; point the init at the temp
+        return [
+            (stmt.start_byte, stmt.start_byte, decl + b"\n" + indent),
+            (n.start_byte, n.end_byte, name),
+        ]
+
+    # "wrap": replace the statement with a block holding the temp
+    s0, s1 = stmt.start_byte, stmt.end_byte
+    ra, rb = n.start_byte - s0, n.end_byte - s0
+    stmt_text = ctx.src[s0:s1]
+    new_stmt = stmt_text[:ra] + name + stmt_text[rb:]
+    block = (b"{\n" + indent + b"    " + decl + b"\n"
+             + indent + b"    " + new_stmt + b"\n" + indent + b"}")
+    return [(s0, s1, block)]
+
+
 PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
+    ("temp_for_expr", p_temp_for_expr, 16.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
     ("reorder_params", p_reorder_params, 6.0),
@@ -453,10 +568,13 @@ class Mutator:
         *,
         tree: Optional[Tree] = None,
         fn: Optional[Node] = None,
+        types: Optional[dict] = None,
     ) -> Optional[bytes]:
         # `tree`/`fn` let a caller pass a pre-parsed tree for `src` (e.g. the
         # cached parse of the unchanged base source), avoiding a re-parse +
         # find_function on the hot path. They must correspond to `src`.
+        # `types` is the clang type oracle, keyed by base-source spans; pass it
+        # only when `src` is the base (otherwise the spans won't line up).
         if tree is None:
             tree = parse(src)
         if fn is None:
@@ -476,7 +594,7 @@ class Mutator:
                     break
             _name, func, _w = pool.pop(idx)
             try:
-                edits = func(Ctx(src, tree.root_node, fn, rng))
+                edits = func(Ctx(src, tree.root_node, fn, rng, types))
             except Exception:
                 edits = None
             if not edits:
