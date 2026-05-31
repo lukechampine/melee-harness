@@ -46,6 +46,7 @@ import random
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ from ninja_compile import (  # noqa: E402
     compile_batch,
     compile_source_text,
     find_unit_for_function,
+    source_dir_for,
 )
 from objdiff_path import objdiff_cli  # noqa: E402
 from scorer import Scorer  # noqa: E402
@@ -128,8 +130,17 @@ class Shared:
     use_pch: bool = False
     split: int = 0
     pch_path: Optional[Path] = None
-    types: Optional[dict] = None   # clang type oracle (base spans -> type)
     batch: int = 8
+    # Anchor: the source workers currently mutate from (typed). Starts as the
+    # base; on a new best, the improving candidate is re-typed and swapped in,
+    # so the typed passes (inline/temp) build on improvements (hill-climbing).
+    anchor_source: bytes = b""
+    anchor_types: Optional[dict] = None
+    anchor_split: int = 0
+    anchor_version: int = 0
+    reanchor: bool = True
+    clang_flags: Optional[list] = None
+    retype_lock: threading.Lock = field(default_factory=threading.Lock)
     lock: threading.Lock = field(default_factory=threading.Lock)
     stop: threading.Event = field(default_factory=threading.Event)
     best_score: int = 0
@@ -137,6 +148,7 @@ class Shared:
     best_percent: Optional[float] = None
     iters: int = 0
     compiles_failed: int = 0
+    n_reanchor: int = 0
     n_mutate_none: int = 0
     n_dup: int = 0
     prof_mutate: float = 0.0
@@ -147,6 +159,43 @@ class Shared:
 
     def __post_init__(self) -> None:
         self.best_score = self.base_score
+
+
+def _retype(sh: Shared, cand: bytes) -> Optional[dict]:
+    """Re-run the clang type oracle on a candidate (write a temp .c, parse it).
+    ~50ms; only called on a new best, and serialized (one libclang index)."""
+    if sh.clang_flags is None:
+        return None
+    fd, p = tempfile.mkstemp(suffix=".c", prefix=".retype-", dir=str(source_dir_for(sh.unit)))
+    pp = Path(p)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(cand)
+        with sh.retype_lock:
+            return type_oracle.build_oracle(pp, sh.clang_flags)
+    except Exception:
+        return None
+    finally:
+        try:
+            pp.unlink()
+        except OSError:
+            pass
+
+
+def _reanchor(sh: Shared, cand: bytes, score: int) -> None:
+    """Make an improved candidate the new anchor (after re-typing it), unless a
+    concurrent find already beat it."""
+    new_types = _retype(sh, cand)
+    if not new_types:
+        return
+    new_split = src_mutate.prefix_split(cand)
+    with sh.lock:
+        if score <= sh.best_score:
+            sh.anchor_source = cand
+            sh.anchor_types = new_types
+            sh.anchor_split = new_split
+            sh.anchor_version += 1
+            sh.n_reanchor += 1
 
 
 def report_find(sh: Shared, score: int, source: bytes, cand_o: Path) -> None:
@@ -172,7 +221,8 @@ def print_profile(sh: Shared, elapsed: float, jobs: int) -> None:
     print("\n--- profile (summed across workers) ---")
     print(f"  wall {elapsed:.1f}s x {jobs} workers = {worker_wall:.1f}s worker-time; "
           f"{sh.iters} scored ({sh.iters / elapsed:.1f}/s)")
-    print(f"  compile-fail {sh.compiles_failed}, dup {sh.n_dup}, no-mutation {sh.n_mutate_none}")
+    print(f"  compile-fail {sh.compiles_failed}, dup {sh.n_dup}, "
+          f"no-mutation {sh.n_mutate_none}, re-anchors {sh.n_reanchor}")
     row("mutate", sh.prof_mutate, n_mut)
     row("compile", sh.prof_compile, n_comp)
     row("score", sh.prof_score, n_score)
@@ -186,36 +236,51 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
            mutate_fns: List[str], seed: int) -> None:
     rng = random.Random(seed)
     scorer = make_scorer(sh.unit, sh.fn)
-    base_prefix = sh.base_source[:sh.split]
-    # Parse the base source once per worker; ~75% of steps restart from it
-    # (keep_prob), so reusing this tree avoids re-parsing the whole .c each time.
-    base_tree = src_mutate.parse(sh.base_source)
-    base_fns = {
-        name: src_mutate.find_function(base_tree.root_node, name)
-        for name in set(mutate_fns)
-    }
-    cur = sh.base_source
+    names = set(mutate_fns)
+    base_prefix = sh.base_source[:sh.split]   # the #include block (invariant)
+
+    # Local cache of the current anchor; refreshed when a worker swaps it in.
+    av = -1
+    a_src: bytes = b""
+    a_tree = None
+    a_fns: dict = {}
+    a_types = None
+
+    def refresh() -> None:
+        nonlocal av, a_src, a_tree, a_fns, a_types
+        with sh.lock:
+            a_src = sh.anchor_source
+            a_types = sh.anchor_types
+            av = sh.anchor_version
+        a_tree = src_mutate.parse(a_src)
+        a_fns = {name: src_mutate.find_function(a_tree.root_node, name) for name in names}
+
+    refresh()
+    cur = a_src
     tm = tc = ts = 0.0          # per-thread phase timers (merged at exit)
     n_none = 0
     try:
         while not sh.stop.is_set():
+            if sh.anchor_version != av:     # another worker improved the anchor
+                refresh()
+                cur = a_src
             # --- build a batch of distinct, compilable-looking candidates ---
             t0 = time.perf_counter()
             cands: list = []
             attempts = 0
             while len(cands) < sh.batch and attempts < sh.batch * 4:
                 attempts += 1
-                if cur is not sh.base_source and rng.random() >= sh.keep_prob:
-                    cur = sh.base_source
+                if cur is not a_src and rng.random() >= sh.keep_prob:
+                    cur = a_src
                 mfn = rng.choice(mutate_fns)
-                if cur is sh.base_source:
-                    cand = mutators[mfn].step(cur, rng, tree=base_tree,
-                                              fn=base_fns[mfn], types=sh.types)
+                if cur is a_src:
+                    cand = mutators[mfn].step(cur, rng, tree=a_tree,
+                                              fn=a_fns[mfn], types=a_types)
                 else:
                     cand = mutators[mfn].step(cur, rng)
                 if cand is None:
                     n_none += 1
-                    cur = sh.base_source
+                    cur = a_src
                     continue
                 cur = cand
                 h = hashlib.sha256(cand).digest()
@@ -243,6 +308,7 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
             tc += time.perf_counter() - t0
 
             # --- score each candidate ---
+            best_improve = None     # latest (best) improving candidate this batch
             try:
                 for cand, obj in zip(cands, objs):
                     if sh.stop.is_set():
@@ -283,9 +349,18 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                             sh.stop.set()  # 100% match: stop the whole search
                         if sh.max_iters is not None and sh.iters >= sh.max_iters:
                             sh.stop.set()
+                    if improved and not is_zero:
+                        best_improve = (cand, score)
             finally:
                 for c in cleanups:
                     c.cleanup()
+
+            # Re-anchor on the batch's best improvement (re-type it, ~50ms), so
+            # subsequent typed mutations build on the better candidate.
+            if sh.reanchor and best_improve is not None and not sh.stop.is_set():
+                _reanchor(sh, *best_improve)
+                refresh()
+                cur = a_src
     finally:
         with sh.lock:
             sh.prof_mutate += tm
@@ -312,6 +387,8 @@ def main() -> int:
                     help="print a per-phase timing breakdown on exit")
     ap.add_argument("--no-pch", action="store_true",
                     help="disable the precompiled-header fast path (compile full TU each time)")
+    ap.add_argument("--no-reanchor", action="store_true",
+                    help="don't re-type+re-anchor on improvements (mutate only from the base)")
     ap.add_argument("--batch", type=int, default=16, metavar="K",
                     help="candidates compiled per mwcc invocation, per worker "
                          "(amortizes process startup; default 16, 1 to disable)")
@@ -394,14 +471,18 @@ def main() -> int:
     flags = type_oracle.clang_flags_for(c_file, ROOT / "compile_commands.json")
     if type_oracle.available() and flags is not None:
         types = type_oracle.build_oracle(c_file, flags)
-    print(f"type oracle: {len(types)} expression types"
-          if types else "type oracle: unavailable; temp_for_expr disabled")
+    reanchor = bool(types) and flags is not None and not args.no_reanchor
+    print((f"type oracle: {len(types)} expression types"
+           + ("; re-anchoring on improvements" if reanchor else ""))
+          if types else "type oracle: unavailable; inline/temp_for_expr disabled")
 
     sh = Shared(
         base_score=base_score, base_source=base_source, unit=unit, fn=fn,
         keep_prob=args.keep_prob, max_iters=args.max_iters,
-        use_pch=use_pch, split=split, pch_path=pch_path, types=types,
+        use_pch=use_pch, split=split, pch_path=pch_path,
         batch=max(1, args.batch),
+        anchor_source=base_source, anchor_types=types, anchor_split=split,
+        reanchor=reanchor, clang_flags=flags,
     )
 
     # Ctrl-C just asks the workers to stop. Handling SIGINT here (rather than
