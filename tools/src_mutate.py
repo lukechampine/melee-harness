@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tree-sitter", "tree-sitter-c"]
+# dependencies = ["tree-sitter", "tree-sitter-c", "libclang"]
 # ///
 """
 Source-level mutation engine for the melee permuter (permute.py).
@@ -30,6 +30,7 @@ import difflib
 import random
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import tree_sitter_c
@@ -762,7 +763,109 @@ def _jump_escapes_run(jump: Node, run_start: int, run_end: int) -> bool:
     return True
 
 
-def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str):
+def _rederivable_locals(fn: Node, locals_: set) -> dict:
+    """Map each body local with a single-declarator initializer to
+    `(decl_text, {freevar_name: id_node}, decl_start)`. The freevars are other
+    in-scope locals the initializer reads. This lets a helper *re-derive* the
+    local from its initializer (the very common `Item* ip = GET_ITEM(gobj);` at
+    the top of the helper) and take those freevars as params, instead of
+    receiving the local directly -- the shape the "pass all used outer locals"
+    heuristic can't otherwise reproduce. Top-level body decls only (the common
+    case; keeps it simple and avoids scope subtleties)."""
+    body = body_of(fn)
+    out: dict = {}
+    if body is None:
+        return out
+    for d in body.named_children:
+        if d.type != "declaration":
+            continue
+        ty = field(d, "type")
+        decls = [c for c in d.named_children
+                 if not (ty is not None
+                         and (c.start_byte, c.end_byte) == (ty.start_byte, ty.end_byte))]
+        if len(decls) != 1 or decls[0].type != "init_declarator":
+            continue
+        idc = decls[0]
+        nm = _declared_name(idc)
+        init = field(idc, "value")
+        if not nm or init is None:
+            continue
+        freev: dict = {}
+        bad = False
+        for m in iter_subtree(init):
+            if m.type in ("assignment_expression", "update_expression"):
+                bad = True   # re-running a side-effecting init would diverge
+                break
+            if m.type == "identifier":
+                inm = m.text.decode()
+                if inm in locals_ and inm != nm:
+                    freev.setdefault(inm, m)
+        if bad:
+            continue
+        out[nm] = (d.text, freev, d.start_byte)
+    return out
+
+
+def _decl_spell_map(fn: Node, src: bytes) -> dict:
+    """`{local_name: b'<type> <declarator>'}` (e.g. `b'HSD_GObj* gobj'`) for the
+    function's params and single-declarator body locals -- the exact verbatim
+    spelling to reuse when a freevar becomes a helper parameter. Verbatim (vs the
+    type oracle) so it survives macro-buried freevars and exotic types."""
+    out: dict = {}
+    fdecl = function_declarator_of(fn)
+    if fdecl is not None:
+        pl = field(fdecl, "parameters")
+        if pl is not None:
+            for p in pl.named_children:
+                if p.type == "parameter_declaration":
+                    nm = _declared_name(p)
+                    if nm:
+                        out[nm] = p.text
+    body = body_of(fn)
+    if body is not None:
+        for d in body.named_children:
+            if d.type != "declaration":
+                continue
+            ty = field(d, "type")
+            kids = [c for c in d.named_children
+                    if not (ty is not None
+                            and (c.start_byte, c.end_byte) == (ty.start_byte, ty.end_byte))]
+            if len(kids) != 1:
+                continue
+            inner = field(kids[0], "declarator") if kids[0].type == "init_declarator" else kids[0]
+            nm = _declared_name(kids[0])
+            if nm and inner is not None:
+                out[nm] = src[d.start_byte:inner.end_byte]
+    return out
+
+
+def _run_local(order: List[str], occ: dict, fn: Node, run_end: int) -> set:
+    """Outer locals whose first use in the run is a plain `nm = ...` full
+    (re)definition and which are never read after the run -- pure run
+    temporaries (e.g. loop-scratch `jobj`, assigned then used only inside the
+    loop). They get declared *inside* the helper instead of passed, which fixes
+    the 'uninitialized variable passed by value' compile error you'd otherwise
+    get from handing a write-before-read local to the helper call."""
+    after = {m.text.decode() for m in iter_subtree(fn)
+             if m.type == "identifier" and m.start_byte >= run_end}
+    res: set = set()
+    for nm in order:
+        if nm in after:
+            continue
+        first = min(occ[nm], key=lambda n: n.start_byte)
+        par = first.parent
+        if par is None or par.type != "assignment_expression":
+            continue
+        op, lhs = field(par, "operator"), field(par, "left")
+        if op is None or op.text != b"=" or lhs is None:
+            continue
+        if (lhs.start_byte, lhs.end_byte) == (first.start_byte, first.end_byte):
+            res.add(nm)
+    return res
+
+
+def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str,
+                spell: dict, rederive=None):
     """Build (start, end, helper_bytes, call_bytes) for extracting `run` into a
     `static inline void` helper, or None if it can't be cleanly extracted."""
     run_start, run_end = run[0].start_byte, run[-1].end_byte
@@ -792,6 +895,13 @@ def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str):
                     if nm not in order:
                         order.append(nm)
     order = [nm for nm in order if nm not in decl_inside]
+
+    # Pure run-temporaries (defined-then-used only within the run): declare them
+    # inside the helper rather than pass them. Needs a verbatim spelling.
+    run_local = {nm for nm in _run_local(order, occ, ctx.fn, run_end) if nm in spell}
+    order = [nm for nm in order if nm not in run_local]
+    prelude: List[Tuple[int, bytes]] = [
+        (min(n.start_byte for n in occ[nm]), spell[nm] + b";") for nm in run_local]
 
     out: set = set()
     for s in run:
@@ -824,11 +934,50 @@ def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str):
     in_params = [nm for nm in order if nm not in out]
     out_params = [nm for nm in order if nm in out]
 
-    hid = f"{fname}_blk{run_start}".encode()
+    # Optional re-derivation: rather than receive an in-param by value, the
+    # helper can re-declare it from its own initializer (verbatim, e.g.
+    # `Item* ip = GET_ITEM(gobj);`) and take that initializer's freevars as
+    # params instead -- the melee shape where helpers recompute ip from gobj.
+    # Freevar params are spelled from their verbatim declarations (`spell`), not
+    # the type oracle: the key freevar (gobj) usually appears only inside a
+    # macro (GET_ITEM) where clang exposes no per-token type.
+    extra_decls: List[bytes] = []
+    extra_args: List[bytes] = []
+    did_rederive = False
+    if rederive:
+        rmap = rederive
+        targets = [nm for nm in in_params if nm in rmap]
+        # keep a name as a param if another re-derived name's init reads it
+        targets = [nm for nm in targets
+                   if not any(nm in rmap[o][1] for o in targets if o != nm)]
+        drop: set = set()
+        seen = set(in_params) | set(out_params)
+        for nm in targets:
+            decl_text, freev, decl_start = rmap[nm]
+            # every freevar must be passable by value: not an out-param, and
+            # with a verbatim declaration to spell it as a helper parameter.
+            if any(fnm in out_params or fnm not in spell for fnm in freev):
+                continue
+            drop.add(nm)
+            prelude.append((decl_start, decl_text))
+            for fnm in freev:
+                if fnm not in seen:
+                    seen.add(fnm)
+                    extra_decls.append(spell[fnm])
+                    extra_args.append(fnm.encode())
+        if drop:
+            in_params = [nm for nm in in_params if nm not in drop]
+            did_rederive = True
+
+    # 'r' marks the re-derived variant so it has a distinct name from the plain
+    # extraction of the same run (run-local decls alone don't rename).
+    hid = (f"{fname}_blk{run_start}").encode() + (b"r" if did_rederive else b"")
     decls = [ptypes[nm].encode() + b" " + nm.encode() for nm in in_params]
+    decls += extra_decls
     decls += [ptypes[nm].encode() + b" *" + nm.encode() for nm in out_params]
     params = b", ".join(decls) if decls else b"void"
-    args = [nm.encode() for nm in in_params] + [b"&" + nm.encode() for nm in out_params]
+    args = ([nm.encode() for nm in in_params] + extra_args
+            + [b"&" + nm.encode() for nm in out_params])
 
     body_text = bytearray(ctx.src[run_start:run_end])
     derefs: List[Edit] = []
@@ -839,8 +988,11 @@ def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str):
     for s0, e0, rep in sorted(derefs, key=lambda x: x[0], reverse=True):
         body_text[s0:e0] = rep
 
+    pre = b""
+    for _, decl_text in sorted(prelude, key=lambda x: x[0]):
+        pre += decl_text + b"\n    "
     helper = (b"static inline void " + hid + b"(" + params + b")\n{\n    "
-              + bytes(body_text) + b"\n}\n\n")
+              + pre + bytes(body_text) + b"\n}\n\n")
     return (run_start, run_end, helper, hid + b"(" + b", ".join(args) + b");")
 
 
@@ -854,11 +1006,21 @@ def _block_inline_sites(ctx: Ctx):
     stmts = [c for c in body.named_children if c.type in STMT_TYPES]
     locals_ = _local_names(ctx.fn)
     fname = fn_name_of(ctx.fn) or "fn"
+    spell = _decl_spell_map(ctx.fn, ctx.src)
+    rederivable = _rederivable_locals(ctx.fn, locals_)
     for i in range(len(stmts)):
         for j in range(i, min(len(stmts), i + 5)):
-            site = _block_site(ctx, stmts[i:j + 1], locals_, fname)
+            run = stmts[i:j + 1]
+            site = _block_site(ctx, run, locals_, fname, spell)
             if site is not None:
                 yield site
+            # Also offer a variant that re-derives every eligible in-param from
+            # its initializer (passing gobj, declaring ip inside) -- a distinct
+            # helper signature the plain extraction can't reach.
+            if rederivable:
+                rsite = _block_site(ctx, run, locals_, fname, spell, rederive=rederivable)
+                if rsite is not None and rsite != site:
+                    yield rsite
 
 
 def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
@@ -981,7 +1143,8 @@ class Mutator:
                 return new
         return None
 
-    def step_named(self, src: bytes, name: str, rng: random.Random) -> Optional[bytes]:
+    def step_named(self, src: bytes, name: str, rng: random.Random,
+                   types: Optional[dict] = None) -> Optional[bytes]:
         """Run exactly one pass by name (debugging)."""
         tree = parse(src)
         fn = find_function(tree.root_node, self.fn_name)
@@ -989,11 +1152,30 @@ class Mutator:
             return None
         for n, f, _w in self.passes:
             if n == name:
-                edits = f(Ctx(src, tree.root_node, fn, rng))
+                edits = f(Ctx(src, tree.root_node, fn, rng, types))
                 if not edits:
                     return None
                 return apply_edits(src, edits)
         raise SystemExit(f"unknown pass: {name}")
+
+
+def _preview_oracle(c_file: Path) -> Optional[dict]:
+    """Best-effort clang type oracle for the standalone preview, so temp_for_expr
+    and the inline passes (which need expression types) are inspectable. Resolves
+    the checkout from the file's location. Returns None if anything is missing --
+    the preview just falls back to the type-free passes."""
+    try:
+        import type_oracle
+        import melee_root
+        root = melee_root.find_checkout(c_file.resolve().parent)
+        if root is None or not type_oracle.available():
+            return None
+        flags = type_oracle.clang_flags_for(c_file.resolve(), root / "compile_commands.json")
+        if flags is None:
+            return None
+        return type_oracle.build_oracle(c_file.resolve(), flags)
+    except Exception:
+        return None
 
 
 def _main() -> int:
@@ -1004,17 +1186,23 @@ def _main() -> int:
     ap.add_argument("--pass", dest="pass_name", default=None)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("-n", type=int, default=1, help="number of stacked mutations")
+    ap.add_argument("--no-types", action="store_true",
+                    help="skip the clang type oracle (disables temp_for_expr/inline previews)")
     args = ap.parse_args()
 
     src = open(args.file, "rb").read()
     rng = random.Random(args.seed)
+    types = None if args.no_types else _preview_oracle(Path(args.file))
     mut = Mutator(args.fn)
     cur = src
     for _ in range(args.n):
+        # the oracle is keyed by base-source spans, so only the first (base) step
+        # may use it; stacked steps mutate derived source where spans don't align.
+        t = types if cur is src else None
         if args.pass_name:
-            new = mut.step_named(cur, args.pass_name, rng)
+            new = mut.step_named(cur, args.pass_name, rng, types=t)
         else:
-            new = mut.step(cur, rng)
+            new = mut.step(cur, rng, types=t)
         if new is None:
             print("(no mutation applied)", file=sys.stderr)
             break
