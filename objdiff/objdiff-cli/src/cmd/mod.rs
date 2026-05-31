@@ -1,5 +1,6 @@
 pub mod diff;
 pub mod report;
+pub mod score;
 
 use std::str::FromStr;
 

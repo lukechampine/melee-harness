@@ -51,11 +51,10 @@ m2c/                   vendored m2c fork (the decompiler tools/decomp.py
 | `decomp.py` | run the vendored m2c fork on a function/TU (vendored from the melee tree; m2c wired via PYTHONPATH) |
 | `checkdiff.py` | stack-frame autofix + rebuild + objdiff-cli diff for a function |
 | `stack_permute.py` | stack-ordering permuter |
-| `permute.py` | source-level permuter: mutates the **real** TU via tree-sitter byte-span edits, compiles it with the exact `build.ninja` mwcc command, scores in-process against the real target. Findings are real diffs that `git apply` to `src/`; by default (`--apply=match`) it writes a 100% match straight back to the source and stops as soon as it finds one. Precompiles the TU's header block once (mwcc PCH) and recompiles only the mutated body per candidate (auto fidelity-gated, `--no-pch` to disable), and compiles K candidates per mwcc invocation (`--batch`, default 16) to amortize process startup with per-candidate salvage on error — together ~5× the throughput of a naive full compile. `--profile` prints a per-phase timing breakdown. |
+| `permute.py` | source-level permuter: mutates the **real** TU via tree-sitter byte-span edits, compiles it with the exact `build.ninja` mwcc command, and scores each candidate with **objdiff itself** (a persistent `objdiff-cli score` server, objdiff-core) — so the score is objdiff's own reloc/data-aware penalty and a score of 0 is a *true* 100% match. Findings are real diffs that `git apply` to `src/`; by default (`--apply=match`) it writes a 100% match straight back to the source and stops as soon as it finds one. Precompiles the TU's header block once (mwcc PCH) and recompiles only the mutated body per candidate (auto fidelity-gated, `--no-pch` to disable), and compiles K candidates per mwcc invocation (`--batch`, default 16) to amortize process startup with per-candidate salvage on error. `--profile` prints a per-phase timing breakdown. |
 | `src_mutate.py` | tree-sitter mutation engine backing `permute.py` (reorder decls/stmts/params, commutative/add-sub/struct-ref/condition rewrites, pad var, **temp_for_expr** = extract a subexpression into a typed temporary, …); runnable standalone to preview one mutation as a diff |
 | `type_oracle.py` | clang (libclang) type oracle backing `temp_for_expr`: one parse of the base TU (using `compile_commands.json` flags, so macros resolve) maps each expression's source span to its type, so the permuter can write `T tmp = expr;`. Built once per run (~100ms), then ~free per candidate |
 | `ninja_compile.py` | compile one TU with its `build.ninja` mwcc command (no Ninja), incl. precompiled-header build (`build_pch`) + `-prefix` reuse; shared by `checkdiff.py` and `permute.py` |
-| `scorer.py`, `objdump.py` | vendored from decomp-permuter (MIT): the in-process objdump-based scorer `permute.py` uses to rank candidates against the target |
 | `infer_struct.py` | struct field inference |
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
@@ -93,7 +92,7 @@ the scripts resolve them locally without touching the system `PATH`:
 
 | `bin/` artifact | source | needs |
 |---|---|---|
-| `objdiff-cli` | `objdiff/` (fork of [encounter/objdiff](https://github.com/encounter/objdiff): unix diffs, percent output, `-f stack`/`-f two-column`, `d=data`) | Rust **1.88+** (edition 2024); `Cargo.lock` pinned |
+| `objdiff-cli` | `objdiff/` (fork of [encounter/objdiff](https://github.com/encounter/objdiff): unix diffs, percent output, `-f stack`/`-f two-column`, `d=data`, and a `score` server subcommand `permute.py` uses to score candidates) | Rust **1.88+** (edition 2024); `Cargo.lock` pinned |
 | `wibo` | `wibo/` (patched fork — see below) | CMake; a non-venv Python ≥3.10 |
 | `MWDBG326.dll` (+ `lmgr326b.dll`) | `mwcc_debug/` (see below) | downloads a pinned Zig toolchain |
 

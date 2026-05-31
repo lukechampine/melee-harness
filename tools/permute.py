@@ -8,9 +8,11 @@ Source-level permuter for melee. Unlike the vendored decomp-permuter (which
 mutates a macro-expanded, pretty-printed copy of the source), this mutates the
 **real** translation unit text via tree-sitter byte-span edits (src_mutate.py),
 compiles the real TU with the exact mwcc command from build.ninja
-(ninja_compile.py), and scores in-process against the real build target
-(scorer.py, a vendored objdump scorer, isolated to one function). A win is
-printed as a unified diff that applies straight to src/.../*.c with `git apply`.
+(ninja_compile.py), and scores each candidate with objdiff itself -- a persistent
+`objdiff-cli score` server (objdiff-core), so the permuter's score is objdiff's
+own penalty (0 = a true 100% match, reloc/data-aware) rather than an approximate
+objdump+difflib diff. A win is printed as a unified diff that applies straight to
+src/.../*.c with `git apply`.
 
 Usage:
   permute.py <func_name> [permute_fn ...] [options]
@@ -67,27 +69,63 @@ from ninja_compile import (  # noqa: E402
     source_dir_for,
 )
 from objdiff_path import objdiff_cli  # noqa: E402
-from scorer import Scorer  # noqa: E402
-
-PPC_OBJDUMP = ROOT / "build/binutils/powerpc-eabi-objdump"
 
 
-def objdump_command(fn: str) -> str:
-    # Match decomp-permuter's PPC defaults (raw bytes + relocs) so its parser
-    # works, then restrict to one symbol to isolate the function in a real,
-    # multi-function TU object.
-    return f"{PPC_OBJDUMP} -dr -EB -mpowerpc -M broadway --disassemble={fn}"
+class ScoreError(Exception):
+    """The score server couldn't score a candidate (bad object / missing symbol).
+    Recoverable: the server keeps running; the permuter just skips the candidate."""
 
 
-def make_scorer(unit: str, fn: str) -> Scorer:
-    return Scorer(
-        str(ROOT / f"build/GALE01/obj/{unit}.o"),
-        stack_differences=True,
-        algorithm="difflib",
-        debug_mode=False,
-        ign_branch_targets=False,
-        objdump_command=objdump_command(fn),
-    )
+class ObjdiffScorer:
+    """Client for a persistent `objdiff-cli score` server. The server parses the
+    target object once, then returns `(diff_score, code_hash)` per candidate over
+    a pipe. diff_score is objdiff's own penalty (0 = true match), so it counts the
+    relocation/data differences the old objdump+difflib scorer was blind to -- and
+    a score of 0 now genuinely means a 100% match. ~25x faster than that scorer
+    too (no per-candidate objdump process). One server per worker thread, so no
+    cross-thread locking on the hot path."""
+
+    def __init__(self, unit: str, fn: str) -> None:
+        target = str(ROOT / f"build/GALE01/obj/{unit}.o")
+        self.proc = subprocess.Popen(
+            [str(objdiff_cli()), "score", target, fn],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        ready = self.proc.stdout.readline()
+        if ready.strip() != "READY":
+            raise RuntimeError(f"objdiff score server did not start: {ready!r}")
+
+    def score(self, obj_path: str):
+        """Return (diff_score, code_hash). Raises ScoreError if this candidate is
+        unscoreable (server stays up), OSError if the server pipe is gone."""
+        try:
+            self.proc.stdin.write(obj_path + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        except (BrokenPipeError, ValueError) as e:
+            raise OSError("objdiff score server pipe closed") from e
+        if not line:
+            raise OSError("objdiff score server closed")
+        parts = line.split()
+        if not parts or parts[0] == "ERR":
+            raise ScoreError(line.strip())
+        return int(parts[0]), parts[1]
+
+    def close(self) -> None:
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.kill()
+
+
+def make_scorer(unit: str, fn: str) -> ObjdiffScorer:
+    return ObjdiffScorer(unit, fn)
 
 
 def objdiff_percent(unit: str, fn: str, cand_o: Path) -> Optional[float]:
@@ -165,6 +203,7 @@ class Shared:
     best_percent: Optional[float] = None
     iters: int = 0
     compiles_failed: int = 0
+    score_errs: int = 0
     n_reanchor: int = 0
     n_mutate_none: int = 0
     n_dup: int = 0
@@ -259,8 +298,8 @@ def print_profile(sh: Shared, elapsed: float, jobs: int) -> None:
     print("\n--- profile (summed across workers) ---")
     print(f"  wall {elapsed:.1f}s x {jobs} workers = {worker_wall:.1f}s worker-time; "
           f"{sh.iters} scored ({sh.iters / elapsed:.1f}/s)")
-    print(f"  compile-fail {sh.compiles_failed}, dup {sh.n_dup}, "
-          f"no-mutation {sh.n_mutate_none}, re-anchors {sh.n_reanchor}")
+    print(f"  compile-fail {sh.compiles_failed}, score-err {sh.score_errs}, "
+          f"dup {sh.n_dup}, no-mutation {sh.n_mutate_none}, re-anchors {sh.n_reanchor}")
     row("mutate", sh.prof_mutate, n_mut)
     row("compile", sh.prof_compile, n_comp)
     row("score", sh.prof_score, n_score)
@@ -360,17 +399,17 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                     t0 = time.perf_counter()
                     try:
                         score, asm_hash = scorer.score(str(obj))
-                    except (subprocess.CalledProcessError, OSError) as e:
-                        # Ctrl-C reaches the in-flight objdump as SIGINT (the only
-                        # check_output in the loop). Shut down quietly instead of
-                        # letting the worker thread dump a traceback.
-                        if sh.stop.is_set() or (
-                            isinstance(e, subprocess.CalledProcessError)
-                            and (e.returncode or 0) < 0
-                        ):
-                            sh.stop.set()
-                            break
-                        raise
+                    except ScoreError:
+                        # Unscoreable candidate (e.g. the symbol vanished): skip it;
+                        # tracked separately from compile failures, server stays up.
+                        ts += time.perf_counter() - t0
+                        with sh.lock:
+                            sh.score_errs += 1
+                        continue
+                    except OSError:
+                        # Server pipe gone -- Ctrl-C or shutdown. Stop quietly.
+                        sh.stop.set()
+                        break
                     ts += time.perf_counter() - t0
                     with sh.lock:
                         sh.iters += 1
@@ -412,6 +451,7 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                 refresh()
                 cur = a_src
     finally:
+        scorer.close()
         with sh.lock:
             sh.prof_mutate += tm
             sh.prof_compile += tc
@@ -516,6 +556,8 @@ def main() -> int:
                   "using full compiles")
             pch_path.unlink(missing_ok=True)
             pch_path = None
+
+    scorer.close()  # workers spawn their own; this baseline server is done
 
     # Type oracle (clang): expression types so temp_for_expr can extract
     # subexpressions into typed temporaries. One clang parse of the base TU at
