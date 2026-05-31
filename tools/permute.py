@@ -119,6 +119,21 @@ def unified_diff(unit: str, base: bytes, cand: bytes) -> str:
     )
 
 
+# In 'novel' re-anchor mode the anchor may move to a candidate scoring up to this
+# many penalty units worse than the best (a valley step toward a multi-helper
+# match), but never further -- so the exploration pointer can't run off to
+# garbage. ~one reorder (60) + slack; best_source still only tracks improvements.
+REANCHOR_VALLEY_MARGIN = 120
+
+# Minimum scored-candidate gap between two *lateral* (novel-codegen) re-anchors.
+# Every eligible lateral move would otherwise re-type (~50ms clang reparse); on a
+# dense plateau that could be once per batch per worker (~50% throughput). This
+# caps it to ~throughput/COOLDOWN re-types/s regardless of how many qualify, while
+# still firing on every eligible when they're sparse (the common case). Real
+# improvements bypass this -- they're rare and always worth taking immediately.
+REANCHOR_COOLDOWN = 25
+
+
 @dataclass
 class Shared:
     base_score: int
@@ -137,8 +152,10 @@ class Shared:
     anchor_source: bytes = b""
     anchor_types: Optional[dict] = None
     anchor_split: int = 0
+    anchor_score: int = 0
     anchor_version: int = 0
-    reanchor: bool = True
+    last_reanchor_iter: int = -(10 ** 9)
+    reanchor_mode: str = "improve"   # off | improve | novel
     clang_flags: Optional[list] = None
     retype_lock: threading.Lock = field(default_factory=threading.Lock)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -182,19 +199,40 @@ def _retype(sh: Shared, cand: bytes) -> Optional[dict]:
             pass
 
 
-def _reanchor(sh: Shared, cand: bytes, score: int) -> None:
-    """Make an improved candidate the new anchor (after re-typing it), unless a
-    concurrent find already beat it."""
+def _reanchor(sh: Shared, cand: bytes, score: int, improved: bool) -> None:
+    """Make a candidate the new anchor (after re-typing it). A real improvement
+    sticks as long as it's still not worse than the live anchor (hill-climb; a
+    stale-worse find loses the race) and bypasses the cooldown. A lateral
+    novel-codegen move sticks only if it's within REANCHOR_VALLEY_MARGIN of the
+    *current best* (valley exploration, re-checked against the live best so an
+    improved best bounds the drift) and the lateral cooldown has elapsed.
+    best_source is untouched here, so neither path can lose the best."""
+    # Cheap pre-check under the lock so a cooldown-blocked or out-of-window
+    # lateral skips the ~50ms re-type entirely (the dense-plateau case the
+    # cooldown exists for). Re-checked authoritatively after the re-type, since
+    # another worker may re-anchor while we're typing.
+    if not improved:
+        with sh.lock:
+            if (score > sh.best_score + REANCHOR_VALLEY_MARGIN
+                    or sh.iters - sh.last_reanchor_iter < REANCHOR_COOLDOWN):
+                return
     new_types = _retype(sh, cand)
     if not new_types:
         return
     new_split = src_mutate.prefix_split(cand)
     with sh.lock:
-        if score <= sh.best_score:
+        if improved:
+            ok = score <= sh.anchor_score
+        else:
+            ok = (score <= sh.best_score + REANCHOR_VALLEY_MARGIN
+                  and sh.iters - sh.last_reanchor_iter >= REANCHOR_COOLDOWN)
+        if ok:
             sh.anchor_source = cand
             sh.anchor_types = new_types
             sh.anchor_split = new_split
+            sh.anchor_score = score
             sh.anchor_version += 1
+            sh.last_reanchor_iter = sh.iters
             sh.n_reanchor += 1
 
 
@@ -308,7 +346,7 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
             tc += time.perf_counter() - t0
 
             # --- score each candidate ---
-            best_improve = None     # latest (best) improving candidate this batch
+            reanchor_cand = None    # candidate to re-anchor to after this batch
             try:
                 for cand, obj in zip(cands, objs):
                     if sh.stop.is_set():
@@ -338,27 +376,39 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                         sh.iters += 1
                         improved = score < sh.best_score
                         is_zero = score == 0
-                        new_asm = asm_hash not in sh.seen_asm
+                        novel = asm_hash not in sh.seen_asm  # never-seen codegen
+                        if novel and len(sh.seen_asm) < 200_000:
+                            sh.seen_asm.add(asm_hash)
                         if improved:
                             sh.best_score = score
                             sh.best_source = cand
-                        if (improved or is_zero) and new_asm:
-                            sh.seen_asm.add(asm_hash)
+                        if (improved or is_zero) and novel:
                             report_find(sh, score, cand, obj)
                         if is_zero:
                             sh.stop.set()  # 100% match: stop the whole search
                         if sh.max_iters is not None and sh.iters >= sh.max_iters:
                             sh.stop.set()
-                    if improved and not is_zero:
-                        best_improve = (cand, score)
+                        b_score = sh.best_score
+                    # Re-anchor on this candidate? Always on an improvement. In
+                    # 'novel' mode also occasionally on a never-seen-codegen
+                    # candidate that isn't far worse than the best -- so the
+                    # search can cross the valleys where multi-helper extractions
+                    # each worsen the score but combine to a match. best_source
+                    # only tracks strict improvements, so this can't lose ground.
+                    if not is_zero and sh.reanchor_mode != "off":
+                        take = improved or (
+                            sh.reanchor_mode == "novel" and novel
+                            and score <= b_score + REANCHOR_VALLEY_MARGIN)
+                        if take and (reanchor_cand is None or score < reanchor_cand[1]):
+                            reanchor_cand = (cand, score, improved)
             finally:
                 for c in cleanups:
                     c.cleanup()
 
-            # Re-anchor on the batch's best improvement (re-type it, ~50ms), so
-            # subsequent typed mutations build on the better candidate.
-            if sh.reanchor and best_improve is not None and not sh.stop.is_set():
-                _reanchor(sh, *best_improve)
+            # Re-anchor (re-type, ~50ms) so subsequent typed mutations build on
+            # the chosen candidate.
+            if reanchor_cand is not None and not sh.stop.is_set():
+                _reanchor(sh, *reanchor_cand)
                 refresh()
                 cur = a_src
     finally:
@@ -387,8 +437,12 @@ def main() -> int:
                     help="print a per-phase timing breakdown on exit")
     ap.add_argument("--no-pch", action="store_true",
                     help="disable the precompiled-header fast path (compile full TU each time)")
-    ap.add_argument("--no-reanchor", action="store_true",
-                    help="don't re-type+re-anchor on improvements (mutate only from the base)")
+    ap.add_argument("--reanchor", choices=["off", "improve", "novel"], default="improve",
+                    help="re-type + re-anchor the search on: 'improve' (default) a new "
+                         "best; 'novel' also occasional not-worse candidates with "
+                         "never-seen codegen (plateau exploration, for multi-helper "
+                         "extractions that don't each improve the score); 'off' to "
+                         "mutate only from the base")
     ap.add_argument("--batch", type=int, default=16, metavar="K",
                     help="candidates compiled per mwcc invocation, per worker "
                          "(amortizes process startup; default 16, 1 to disable)")
@@ -471,9 +525,9 @@ def main() -> int:
     flags = type_oracle.clang_flags_for(c_file, ROOT / "compile_commands.json")
     if type_oracle.available() and flags is not None:
         types = type_oracle.build_oracle(c_file, flags)
-    reanchor = bool(types) and flags is not None and not args.no_reanchor
+    reanchor_mode = args.reanchor if (types and flags is not None) else "off"
     print((f"type oracle: {len(types)} expression types"
-           + ("; re-anchoring on improvements" if reanchor else ""))
+           + (f"; re-anchor={reanchor_mode}" if reanchor_mode != "off" else ""))
           if types else "type oracle: unavailable; inline/temp_for_expr disabled")
 
     sh = Shared(
@@ -482,7 +536,7 @@ def main() -> int:
         use_pch=use_pch, split=split, pch_path=pch_path,
         batch=max(1, args.batch),
         anchor_source=base_source, anchor_types=types, anchor_split=split,
-        reanchor=reanchor, clang_flags=flags,
+        anchor_score=base_score, reanchor_mode=reanchor_mode, clang_flags=flags,
     )
 
     # Ctrl-C just asks the workers to stop. Handling SIGINT here (rather than
