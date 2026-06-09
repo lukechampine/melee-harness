@@ -6,8 +6,7 @@ decomp project.
 ## Invoking the tools
 
 Every script in this repo's `tools/` (`decomp.py`, `checkdiff.py`,
-`stack_permute.py`, `permute.py`, `infer_struct.py`,
-`mwcc_dump.py`, `mwcc_diagnose.py`, `fix_includes.py`,
+`permute.py`, `infer_struct.py`, `mwcc_dump.py`, `mwcc_diagnose.py`, `fix_includes.py`,
 `gen_item_state_table.py`) is run in place against a melee checkout:
 
 ```sh
@@ -49,10 +48,9 @@ m2c/                   vendored m2c fork (the decompiler tools/decomp.py
 | script | purpose |
 |---|---|
 | `decomp.py` | run the vendored m2c fork on a function/TU (vendored from the melee tree; m2c wired via PYTHONPATH) |
-| `checkdiff.py` | stack-frame autofix + rebuild + objdiff-cli diff for a function |
-| `stack_permute.py` | stack-ordering permuter |
-| `permute.py` | source-level permuter: mutates the **real** TU via tree-sitter byte-span edits, compiles it with the exact `build.ninja` mwcc command, and scores each candidate with **objdiff itself** (a persistent `objdiff-cli score` server, objdiff-core) — so the score is objdiff's own reloc/data-aware penalty and a score of 0 is a *true* 100% match. Findings are real diffs that `git apply` to `src/`; by default (`--apply=match`) it writes a 100% match straight back to the source and stops as soon as it finds one. Precompiles the TU's header block once (mwcc PCH) and recompiles only the mutated body per candidate (auto fidelity-gated, `--no-pch` to disable), and compiles K candidates per mwcc invocation (`--batch`, default 16) to amortize process startup with per-candidate salvage on error. `--profile` prints a per-phase timing breakdown. |
-| `src_mutate.py` | tree-sitter mutation engine backing `permute.py` (reorder decls/stmts/params, commutative/add-sub/struct-ref/condition rewrites, pad var, **temp_for_expr** = extract a subexpression into a typed temporary, …); runnable standalone to preview one mutation as a diff |
+| `checkdiff.py` | fix includes + rebuild + objdiff-cli diff for a function |
+| `permute.py` | source-level permuter: mutates the **real** TU via tree-sitter byte-span edits, compiles it with the exact `build.ninja` mwcc command, and scores each candidate with **objdiff itself** (a persistent `objdiff-cli score` server, objdiff-core). Candidates are ranked by mismatch class first — hard structural/instruction-selection rows, then deduped regswaps, then stack/frame rows, with objdiff's raw reloc/data-aware penalty as the final tie-breaker — and a raw score of 0 is a *true* 100% match. Findings are real diffs that `git apply` to `src/`; by default (`--apply=match`) it writes a 100% match straight back to the source and stops as soon as it finds one. Improved candidates are narrowed after the search by attempting to revert nonessential diff chunks while preserving the best score (`--no-narrow` to skip, `--narrow-passes` to tune). Best candidates report their mutation provenance; `--save-replay` writes a hash-checked JSON edit recipe, and `--replay` reconstructs/scores/applies that recipe later. Precompiles the TU's header block once (mwcc PCH) and recompiles only the mutated body per candidate (auto fidelity-gated, `--no-pch` to disable), and compiles K candidates per mwcc invocation (`--batch`, default 16) to amortize process startup with per-candidate salvage on error. `--profile` prints a per-phase timing breakdown. |
+| `src_mutate.py` | tree-sitter mutation engine backing `permute.py` (reorder decls/stmts/params, commutative/add-sub/struct-ref/condition/no-op branch rewrites, scoped MWCC pragmas, volatile decls, helper extraction/manual inlining, pad var, **temp_for_expr** = extract a subexpression into a typed temporary, …); runnable standalone to preview one mutation as a diff |
 | `type_oracle.py` | clang (libclang) type oracle backing `temp_for_expr`: one parse of the base TU (using `compile_commands.json` flags, so macros resolve) maps each expression's source span to its type, so the permuter can write `T tmp = expr;`. Built once per run (~100ms), then ~free per candidate |
 | `ninja_compile.py` | compile one TU with its `build.ninja` mwcc command (no Ninja), incl. precompiled-header build (`build_pch`) + `-prefix` reuse; shared by `checkdiff.py` and `permute.py` |
 | `infer_struct.py` | struct field inference |
@@ -60,6 +58,7 @@ m2c/                   vendored m2c fork (the decompiler tools/decomp.py
 | `gen_item_state_table.py` | item state-table generator |
 | `mwcc_dump.py` | dump the mwcc_debug compiler's listing for one function → `pcdump.txt` |
 | `mwcc_diagnose.py` | mode-oriented mismatch diagnostics that combine checkdiff/objdiff with mwcc_dump |
+| `find_stale_nonmatching_tus.py` | list `Object(NonMatching, ...)` TUs whose reported functions are all 100% matched, so `configure.py` can be flipped |
 
 ### .claude/hooks/
 
@@ -228,7 +227,7 @@ For stack-heavy objdiff summaries, run the first diagnostic mode:
 MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/mwcc_diagnose.py stack it_8026CD50
 ```
 
-`mwcc_diagnose.py stack` runs checkdiff's temporary compile/diff path without
-the stack-frame autofix, lists the target/current `r1` offset deltas, then adds
+`mwcc_diagnose.py stack` runs checkdiff's temporary compile/diff path, lists
+the target/current `r1` offset deltas, then adds
 mwcc_dump's current-C frame and stack-slot summary with guidance for likely
 local ordering, aggregate, padding, or hidden-temp causes.

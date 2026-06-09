@@ -2,8 +2,9 @@
 """Dump the mwcc_debug compiler's IR/backend listing for one function.
 
 Resolves the function's TU (via build/GALE01/report.json, like checkdiff.py),
-compiles that TU with the instrumented MWCC, then truncates pcdump.txt to
-just that function's section so the output concerns only that function.
+compiles that TU with the instrumented MWCC from a unique temporary working
+directory, then truncates that run's pcdump.txt to just the requested
+function's section so the output concerns only that function.
 
 Usage: tools/mwcc_dump.py it_802E70BC
        tools/mwcc_dump.py --runner wibo it_802E70BC
@@ -18,17 +19,17 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 # Melee checkout root: explicit override, then Claude Code's project dir,
 # then assume this script lives at <melee>/tools/.
-ROOT = Path(
-    os.environ.get("MELEE_ROOT")
-    or os.environ.get("CLAUDE_PROJECT_DIR")
-    or Path(__file__).resolve().parents[1]
-)
+from melee_root import resolve_root
+
+ROOT = resolve_root()
 REPORT_PATH = ROOT / "build/GALE01/report.json"
 
 
@@ -330,48 +331,239 @@ def is_arg_reg(reg: str) -> bool:
     return re.fullmatch(r"r([3-9]|10)", reg) is not None
 
 
-def find_stack_slot_summaries(lines: list[str]) -> list[str]:
-    insts = [
-        (idx, line, parsed)
-        for idx, line in enumerate(lines)
-        if (parsed := parse_inst(line))
-    ]
-    slots: dict[str, dict[str, object]] = {}
-    stack_ptrs: dict[str, tuple[str, Optional[int], str]] = {}
+@dataclass
+class MwccInstruction:
+    index: int
+    line_no: int
+    block: Optional[str]
+    op: str
+    operands: list[str]
+    text: str
+    raw: str
+    flags: tuple[str, ...]
 
-    def slot_info(key: str) -> dict[str, object]:
-        return slots.setdefault(key, {
-            "ops": Counter(),
-            "load_ops": Counter(),
-            "store_ops": Counter(),
-            "deltas": set(),
-            "volatile": False,
-            "fctiwz": False,
-            "ptr_defs": [],
-            "arg_ptrs": [],
-            "indexed_ops": Counter(),
-            "index_regs": set(),
-            "samples": [],
-        })
 
-    def remember_sample(info: dict[str, object], text: str) -> None:
-        samples = info["samples"]
-        assert isinstance(samples, list)
-        if len(samples) < 2:
-            samples.append(text)
+@dataclass
+class SavedRegister:
+    op: str
+    reg: str
+    offset: int
+    instruction: str
+    line_no: int
+    block: Optional[str]
 
-    for inst_pos, (_idx, line, (op, operands, text)) in enumerate(insts):
+
+@dataclass
+class MwccStackRef:
+    slot: str
+    delta: Optional[int]
+    kind: str
+    op: str
+    instruction: str
+    line_no: int
+    block: Optional[str]
+    flags: tuple[str, ...] = ()
+    dest_reg: Optional[str] = None
+    base_reg: Optional[str] = None
+    ptr_reg: Optional[str] = None
+    index_reg: Optional[str] = None
+    conversion: bool = False
+
+    @property
+    def is_arg_ptr(self) -> bool:
+        return self.ptr_reg is not None and is_arg_reg(self.ptr_reg)
+
+    @property
+    def numeric_offset(self) -> Optional[int]:
+        base = numeric_slot_base(self.slot)
+        if base is None:
+            return None
+        return base + (self.delta or 0)
+
+
+@dataclass
+class MwccStackSlot:
+    name: str
+    refs: list[MwccStackRef] = field(default_factory=list)
+
+    def add(self, ref: MwccStackRef) -> None:
+        self.refs.append(ref)
+
+    @property
+    def ops(self) -> Counter[str]:
+        return Counter(ref.op for ref in self.refs)
+
+    @property
+    def load_ops(self) -> Counter[str]:
+        return Counter(ref.op for ref in self.refs if is_offset_mem_op(ref.op) and not ref.op.startswith("st"))
+
+    @property
+    def store_ops(self) -> Counter[str]:
+        return Counter(ref.op for ref in self.refs if is_offset_mem_op(ref.op) and ref.op.startswith("st"))
+
+    @property
+    def indexed_ops(self) -> Counter[str]:
+        return Counter(ref.op for ref in self.refs if ref.kind == "indexed")
+
+    @property
+    def deltas(self) -> set[int]:
+        return {ref.delta for ref in self.refs if ref.delta is not None}
+
+    @property
+    def index_regs(self) -> set[str]:
+        return {ref.index_reg for ref in self.refs if ref.index_reg is not None}
+
+    @property
+    def ptr_defs(self) -> list[MwccStackRef]:
+        return [ref for ref in self.refs if ref.kind == "ptr"]
+
+    @property
+    def arg_ptrs(self) -> list[MwccStackRef]:
+        return [ref for ref in self.ptr_defs if ref.is_arg_ptr]
+
+    @property
+    def has_volatile(self) -> bool:
+        return any("fIsVolatile" in ref.flags for ref in self.refs)
+
+    @property
+    def has_conversion(self) -> bool:
+        return any(ref.conversion for ref in self.refs)
+
+    @property
+    def samples(self) -> list[str]:
+        return [ref.instruction for ref in self.refs]
+
+
+@dataclass
+class MwccStackAnalysis:
+    pass_name: str
+    instructions: list[MwccInstruction]
+    frame_size: Optional[int]
+    saved_regs: list[SavedRegister]
+    slots: dict[str, MwccStackSlot]
+
+
+def line_flags(line: str) -> tuple[str, ...]:
+    if ";" not in line:
+        return ()
+    return tuple(part.strip().split()[0] for part in line.split(";")[1:] if part.strip())
+
+
+def parse_mwcc_instructions(lines: list[str]) -> list[MwccInstruction]:
+    insts: list[MwccInstruction] = []
+    block = None
+    for line_no, line in enumerate(lines, start=1):
+        block_match = re.match(r"^(B\d+):\s+", line)
+        if block_match is not None:
+            block = block_match.group(1)
+            continue
+        parsed = parse_inst(line)
+        if parsed is None:
+            continue
+        op, operands, text = parsed
+        insts.append(
+            MwccInstruction(
+                index=len(insts),
+                line_no=line_no,
+                block=block,
+                op=op,
+                operands=operands,
+                text=text,
+                raw=line,
+                flags=line_flags(line),
+            )
+        )
+    return insts
+
+
+def numeric_slot_base(slot: str) -> Optional[int]:
+    if re.fullmatch(r"-?\d+", slot):
+        return int(slot)
+    if re.fullmatch(r"-?0x[0-9a-fA-F]+", slot):
+        return int(slot, 0)
+    match = re.fullmatch(r"sp([0-9a-fA-F]+)", slot)
+    if match is not None:
+        return int(match.group(1), 16)
+    return None
+
+
+def stack_slot_priority(slot: MwccStackSlot) -> int:
+    priority = 0
+    if has_vec3_deltas(slot.deltas) and slot.store_ops.get("stfs", 0) >= 3:
+        priority = max(priority, 4)
+    if slot.indexed_ops:
+        priority = max(priority, 4)
+    if slot.has_volatile and slot.load_ops.get("lwz", 0) and slot.store_ops.get("stw", 0):
+        priority = max(priority, 3)
+    if slot.has_conversion and slot.store_ops.get("stfd", 0):
+        priority = max(priority, 3)
+    if slot.arg_ptrs:
+        priority = max(priority, 2)
+    return priority
+
+
+def analyze_stack_pass(lines: list[str], pass_name: Optional[str] = None) -> MwccStackAnalysis:
+    if pass_name is None:
+        pass_name = lines[0] if lines else "<none>"
+
+    insts = parse_mwcc_instructions(lines)
+    frame_size = None
+    saved_regs: list[SavedRegister] = []
+    slots: dict[str, MwccStackSlot] = {}
+    stack_ptrs: dict[str, tuple[str, Optional[int], MwccStackRef]] = {}
+
+    def slot_for(name: str) -> MwccStackSlot:
+        return slots.setdefault(name, MwccStackSlot(name))
+
+    def add_ref(ref: MwccStackRef) -> MwccStackRef:
+        slot_for(ref.slot).add(ref)
+        return ref
+
+    for pos, inst in enumerate(insts):
+        op = inst.op
+        operands = inst.operands
+        recent_ops = [prior.op for prior in insts[max(0, pos - 3):pos]]
+        conversion = op in {"lfd", "stfd"} and ("xoris" in recent_ops or "fctiwz" in recent_ops)
+
+        if op == "stwu" and len(operands) >= 2 and operands[0] == "r1":
+            match = re.match(r"-(\d+)\(r1\)", operands[1])
+            if match is not None and frame_size is None:
+                frame_size = int(match.group(1))
+
+        if op in {"stmw", "stw", "stfd"} and len(operands) >= 2:
+            base = reg_from_offset_operand(operands[1])
+            if base is not None and base[1] == "r1" and re.fullmatch(r"f?r?\d+", operands[0]):
+                if "@" not in operands[1]:
+                    saved_regs.append(
+                        SavedRegister(
+                            op=op,
+                            reg=operands[0],
+                            offset=base[0],
+                            instruction=inst.text,
+                            line_no=inst.line_no,
+                            block=inst.block,
+                        )
+                    )
+
         if op == "addi" and len(operands) == 3 and operands[1] == "r1":
             key, delta = split_stack_expr(operands[2])
-            stack_ptrs[operands[0]] = (key, delta, text)
-            info = slot_info(key)
-            ptr_defs = info["ptr_defs"]
-            assert isinstance(ptr_defs, list)
-            ptr_defs.append(text)
-            if is_arg_reg(operands[0]):
-                arg_ptrs = info["arg_ptrs"]
-                assert isinstance(arg_ptrs, list)
-                arg_ptrs.append(text)
+            ref = add_ref(
+                MwccStackRef(
+                    slot=key,
+                    delta=delta,
+                    kind="ptr",
+                    op=op,
+                    instruction=inst.text,
+                    line_no=inst.line_no,
+                    block=inst.block,
+                    flags=inst.flags,
+                    dest_reg=operands[0],
+                    base_reg="r1",
+                    ptr_reg=operands[0],
+                    conversion=False,
+                )
+            )
+            stack_ptrs[operands[0]] = (key, delta, ref)
 
         if is_offset_mem_op(op) and len(operands) >= 2:
             for operand in operands[1:]:
@@ -382,111 +574,143 @@ def find_stack_slot_summaries(lines: list[str]) -> list[str]:
                 if base != "r1":
                     continue
                 key, delta = split_stack_expr(expr)
-                info = slot_info(key)
-                ops = info["ops"]
-                assert isinstance(ops, Counter)
-                ops[op] += 1
-                if delta is not None:
-                    deltas = info["deltas"]
-                    assert isinstance(deltas, set)
-                    deltas.add(delta)
-                if "fIsVolatile" in line:
-                    info["volatile"] = True
-                if op.startswith("st"):
-                    store_ops = info["store_ops"]
-                    assert isinstance(store_ops, Counter)
-                    store_ops[op] += 1
-                else:
-                    load_ops = info["load_ops"]
-                    assert isinstance(load_ops, Counter)
-                    load_ops[op] += 1
-                if op == "stfd":
-                    recent = [
-                        prior[2][0]
-                        for prior in insts[max(0, inst_pos - 3):inst_pos]
-                    ]
-                    if "fctiwz" in recent:
-                        info["fctiwz"] = True
-                remember_sample(info, text)
+                add_ref(
+                    MwccStackRef(
+                        slot=key,
+                        delta=delta,
+                        kind="mem",
+                        op=op,
+                        instruction=inst.text,
+                        line_no=inst.line_no,
+                        block=inst.block,
+                        flags=inst.flags,
+                        dest_reg=operands[0] if operands else None,
+                        base_reg=base,
+                        conversion=conversion,
+                    )
+                )
 
         if is_indexed_mem_op(op):
-            match = re.search(r"\((r\d+),(r\d+)\)", text)
+            match = re.search(r"\((r\d+),(r\d+)\)", inst.text)
             if match is None:
                 continue
             base_reg, index_reg = match.groups()
             if base_reg not in stack_ptrs:
                 continue
-            key, _delta, _def_text = stack_ptrs[base_reg]
-            info = slot_info(key)
-            indexed_ops = info["indexed_ops"]
-            assert isinstance(indexed_ops, Counter)
-            indexed_ops[op] += 1
-            index_regs = info["index_regs"]
-            assert isinstance(index_regs, set)
-            index_regs.add(index_reg)
-            remember_sample(info, text)
-
-    summaries: list[tuple[int, str]] = []
-    for key, info in slots.items():
-        ops = info["ops"]
-        load_ops = info["load_ops"]
-        store_ops = info["store_ops"]
-        indexed_ops = info["indexed_ops"]
-        deltas = info["deltas"]
-        index_regs = info["index_regs"]
-        arg_ptrs = info["arg_ptrs"]
-        samples = info["samples"]
-        assert isinstance(ops, Counter)
-        assert isinstance(load_ops, Counter)
-        assert isinstance(store_ops, Counter)
-        assert isinstance(indexed_ops, Counter)
-        assert isinstance(deltas, set)
-        assert isinstance(index_regs, set)
-        assert isinstance(arg_ptrs, list)
-        assert isinstance(samples, list)
-
-        parts = []
-        priority = 0
-        if has_vec3_deltas(deltas) and store_ops.get("stfs", 0) >= 3:
-            parts.append(f"Vec3-like f32 stores at {format_deltas(deltas)}")
-            priority = max(priority, 4)
-        if indexed_ops:
-            indexed_summary = ", ".join(
-                f"{name}={indexed_ops[name]}" for name in sorted(indexed_ops)
+            key, delta, _ptr_ref = stack_ptrs[base_reg]
+            add_ref(
+                MwccStackRef(
+                    slot=key,
+                    delta=delta,
+                    kind="indexed",
+                    op=op,
+                    instruction=inst.text,
+                    line_no=inst.line_no,
+                    block=inst.block,
+                    flags=inst.flags,
+                    dest_reg=operands[0] if operands else None,
+                    base_reg=base_reg,
+                    index_reg=index_reg,
+                    conversion=False,
+                )
             )
-            index_summary = ", ".join(sorted(index_regs))
+
+    return MwccStackAnalysis(
+        pass_name=pass_name,
+        instructions=insts,
+        frame_size=frame_size,
+        saved_regs=saved_regs,
+        slots=slots,
+    )
+
+
+def format_frame_summary(analysis: MwccStackAnalysis) -> list[str]:
+    if analysis.frame_size is None and not analysis.slots:
+        return []
+    frame = (
+        f"0x{analysis.frame_size:x} ({analysis.frame_size} bytes)"
+        if analysis.frame_size is not None
+        else "unknown"
+    )
+    out = [f"  frame: {frame}"]
+    if analysis.saved_regs:
+        uniq = []
+        for saved in analysis.saved_regs:
+            text = f"{saved.op} {saved.reg}@{saved.offset}"
+            if text not in uniq:
+                uniq.append(text)
+        out.append("  saved regs: " + ", ".join(uniq))
+
+    local_slots = {
+        name: slot
+        for name, slot in analysis.slots.items()
+        if name.startswith("@")
+    }
+    if local_slots:
+        parts = []
+        for name, slot in sorted(local_slots.items()):
+            tag = " (i2f/fctiwz temp)" if slot.has_conversion else ""
+            opsum = ",".join(f"{k}={v}" for k, v in sorted(slot.ops.items()))
+            parts.append(f"{name}[{opsum}]{tag}")
+        out.append(f"  local stack slots ({len(local_slots)}): " + "; ".join(parts))
+    return out
+
+
+def format_stack_slot_summaries(
+    analysis: MwccStackAnalysis,
+    *,
+    max_slots: Optional[int] = 8,
+    include_quiet: bool = False,
+) -> list[str]:
+    summaries: list[tuple[int, str]] = []
+    for key, slot in analysis.slots.items():
+        parts = []
+        priority = stack_slot_priority(slot)
+        if has_vec3_deltas(slot.deltas) and slot.store_ops.get("stfs", 0) >= 3:
+            parts.append(f"Vec3-like f32 stores at {format_deltas(slot.deltas)}")
+        if slot.indexed_ops:
+            indexed_summary = ", ".join(
+                f"{name}={slot.indexed_ops[name]}" for name in sorted(slot.indexed_ops)
+            )
+            index_summary = ", ".join(sorted(slot.index_regs))
             parts.append(
                 f"indexed stack array ({indexed_summary}; index regs {index_summary})"
             )
-            priority = max(priority, 4)
-        if info["volatile"] and load_ops.get("lwz", 0) and store_ops.get("stw", 0):
+        if slot.has_volatile and slot.load_ops.get("lwz", 0) and slot.store_ops.get("stw", 0):
             parts.append(
-                f"volatile s32 slot (lwz={load_ops['lwz']}, stw={store_ops['stw']})"
+                f"volatile s32 slot (lwz={slot.load_ops['lwz']}, stw={slot.store_ops['stw']})"
             )
-            priority = max(priority, 3)
-        if info["fctiwz"] and store_ops.get("stfd", 0):
+        if slot.has_conversion and slot.store_ops.get("stfd", 0):
             parts.append("fctiwz conversion scratch")
-            priority = max(priority, 3)
-        if arg_ptrs:
-            parts.append(f"passed by pointer via {arg_ptrs[0]}")
-            priority = max(priority, 2)
+        if slot.arg_ptrs:
+            parts.append(f"passed by pointer via {slot.arg_ptrs[0].instruction}")
 
-        # Avoid noisy callee-save and frame-bookkeeping slots unless they also
-        # matched a useful local-stack pattern above.
-        if not parts or priority < 2:
+        if include_quiet and not parts:
+            opsum = ",".join(f"{k}={v}" for k, v in sorted(slot.ops.items()))
+            parts.append(f"ops {opsum}")
+
+        # Avoid noisy callee-save and frame-bookkeeping slots unless requested
+        # or they matched a useful local-stack pattern above.
+        if not parts or (priority < 2 and not include_quiet):
             continue
 
-        if samples:
-            parts.append(f"sample: {samples[0]}")
+        if slot.refs:
+            parts.append(f"sample: {slot.refs[0].instruction}")
         summaries.append((priority, f"    {key}: " + "; ".join(parts)))
 
     if not summaries:
         return []
 
     summaries.sort(key=lambda item: (-item[0], item[1]))
+    if max_slots is not None:
+        summaries = summaries[:max_slots]
     out = ["  stack slots:"]
-    out.extend(text for _, text in summaries[:8])
+    out.extend(text for _, text in summaries)
     return out
+
+
+def find_stack_slot_summaries(lines: list[str]) -> list[str]:
+    return format_stack_slot_summaries(analyze_stack_pass(lines))
 
 
 def infer_register_roles(lines: list[str]) -> list[str]:
@@ -805,59 +1029,7 @@ def find_frame_summary(lines: list[str]) -> list[str]:
     (frame/stack) mismatch: it lets you compare frame size and slot count
     without opening the multi-thousand-line pcdump.
     """
-    frame = None
-    saved = []
-    local_slots: dict[str, Counter] = {}
-    conv_slots: set[str] = set()
-
-    insts = [parsed for line in lines if (parsed := parse_inst(line))]
-    for pos, (op, operands, _text) in enumerate(insts):
-        if op == "stwu" and len(operands) >= 2 and operands[0] == "r1":
-            m = re.match(r"-(\d+)\(r1\)", operands[1])
-            if m is not None and frame is None:
-                n = int(m.group(1))
-                frame = f"0x{n:x} ({n} bytes)"
-        elif op in {"stmw", "stw", "stfd"} and len(operands) >= 2:
-            base = reg_from_offset_operand(operands[1])
-            if base is not None and base[1] == "r1" and re.fullmatch(
-                r"f?r?\d+", operands[0]
-            ):
-                # Saved callee registers live at high, fixed offsets; skip
-                # @NNN compiler temps (handled below).
-                if "@" not in operands[1]:
-                    saved.append(f"{op} {operands[0]}@{base[0]}")
-        # Distinct compiler local slots: @NNN(r1) / addi rD,r1,@NNN.
-        for operand in operands:
-            m = re.search(r"(@\d+)(?:\+\d+)?\(r1\)", operand)
-            if m is None and operand.startswith("@") and "r1" in (
-                operands[0] if operands else ""
-            ):
-                m = re.match(r"(@\d+)", operand)
-            if m is not None:
-                slot = m.group(1)
-                local_slots.setdefault(slot, Counter())[op] += 1
-                window = [p[0] for p in insts[max(0, pos - 3):pos]]
-                if op == "lfd" and ("xoris" in window or "fctiwz" in window):
-                    conv_slots.add(slot)
-
-    if frame is None and not local_slots:
-        return []
-    out = [f"  frame: {frame or 'unknown'}"]
-    if saved:
-        # De-dup stmw expands to one entry; keep it compact.
-        uniq = []
-        for s in saved:
-            if s not in uniq:
-                uniq.append(s)
-        out.append("  saved regs: " + ", ".join(uniq[:8]))
-    if local_slots:
-        parts = []
-        for slot, ops in sorted(local_slots.items()):
-            tag = " (i2f/fctiwz temp)" if slot in conv_slots else ""
-            opsum = ",".join(f"{k}={v}" for k, v in sorted(ops.items()))
-            parts.append(f"{slot}[{opsum}]{tag}")
-        out.append(f"  local stack slots ({len(local_slots)}): " + "; ".join(parts[:10]))
-    return out
+    return format_frame_summary(analyze_stack_pass(lines))
 
 
 def print_shape_summary(func: str, pcdump: Path, section: str) -> None:
@@ -873,10 +1045,11 @@ def print_shape_summary(func: str, pcdump: Path, section: str) -> None:
     print(f"[mwcc_dump] passes: {format_pass_counts(pass_names)}")
     print(f"[mwcc_dump] shape analysis from: {pass_name}")
 
+    stack_analysis = analyze_stack_pass(pass_lines, pass_name)
     details = (
-        find_frame_summary(pass_lines)
+        format_frame_summary(stack_analysis)
         + find_address_forms(pass_lines)
-        + find_stack_slot_summaries(pass_lines)
+        + format_stack_slot_summaries(stack_analysis)
         + find_branch_shapes(pass_lines)
         + find_copy_shapes(section, pass_lines)
         + find_rederivations(pass_lines)
@@ -888,12 +1061,11 @@ def print_shape_summary(func: str, pcdump: Path, section: str) -> None:
         print("[mwcc_dump]  no address/branch/copy patterns recognized")
 
 
-def finalize_dump(func: str) -> int:
-    """Truncate pcdump.txt to just `func`'s section and print a one-line
+def finalize_dump(func: str, pcdump: Path) -> int:
+    """Truncate `pcdump` to just `func`'s section and print a one-line
     summary. Returns a process-style exit code (0 = section found)."""
-    pcdump = ROOT / "pcdump.txt"
     if not pcdump.exists():
-        print("[mwcc_dump] no pcdump.txt produced", file=sys.stderr)
+        print(f"[mwcc_dump] no pcdump.txt produced at {pcdump}", file=sys.stderr)
         return 1
 
     body = pcdump.read_text(errors="replace")
@@ -906,6 +1078,7 @@ def finalize_dump(func: str) -> int:
         present = re.findall(r"^Starting function (\S+)", body, re.M)
         print(f"[mwcc_dump] {func!r} not found (inlined or wrong name); "
               f"present: {format_functions(present)}", file=sys.stderr)
+        print(f"[mwcc_dump] full dump available at: {pcdump}", file=sys.stderr)
         return 1
 
     pcdump.write_text(section)
@@ -941,8 +1114,55 @@ def wibo_path() -> Path:
     return ROOT / "build/tools/wibo"
 
 
-def build_command(runner: str, cc: Path, cflags: str, src: str) -> list[str]:
-    args = [str(cc), *shlex.split(cflags), "-c", src, "-o", "/tmp/mwcc_dump.o"]
+def absolute_repo_path(path: str) -> str:
+    p = Path(path)
+    return str(p if p.is_absolute() else ROOT / p)
+
+
+def absolutize_cflags(cflags: str) -> list[str]:
+    """Make path-bearing cflags independent of the process cwd."""
+    parts = shlex.split(cflags)
+    out: list[str] = []
+    path_options = {"-i", "-I", "-ir", "-include"}
+    idx = 0
+    while idx < len(parts):
+        arg = parts[idx]
+        if arg in path_options and idx + 1 < len(parts):
+            out.append(arg)
+            out.append(absolute_repo_path(parts[idx + 1]))
+            idx += 2
+            continue
+        if arg.startswith("-I") and len(arg) > 2:
+            out.append("-I" + absolute_repo_path(arg[2:]))
+            idx += 1
+            continue
+        out.append(arg)
+        idx += 1
+    return out
+
+
+def dump_workdir(func: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", func)
+    root = ROOT / "build/mwcc-dump"
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{safe}-", dir=root))
+
+
+def build_command(
+    runner: str,
+    cc: Path,
+    cflags: str,
+    src: str,
+    out_obj: Path,
+) -> list[str]:
+    args = [
+        str(cc),
+        *absolutize_cflags(cflags),
+        "-c",
+        absolute_repo_path(src),
+        "-o",
+        str(out_obj),
+    ]
     if runner == "wibo":
         return [str(wibo_path()), *args]
     if runner == "wine":
@@ -953,18 +1173,24 @@ def build_command(runner: str, cc: Path, cflags: str, src: str) -> list[str]:
     raise AssertionError(runner)
 
 
-def run_compiler(runner: str, cc: Path, cflags: str, src: str) -> subprocess.CompletedProcess[str]:
-    pcdump = ROOT / "pcdump.txt"
-    if pcdump.exists():
-        pcdump.unlink()
+def run_compiler(
+    runner: str,
+    cc: Path,
+    cflags: str,
+    src: str,
+    func: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    workdir = dump_workdir(func)
+    pcdump = workdir / "pcdump.txt"
+    out_obj = workdir / "mwcc_dump.o"
 
     env = os.environ.copy()
     if runner == "wine":
         env.setdefault("WINEDEBUG", "-all")
 
     proc = subprocess.run(
-        build_command(runner, cc, cflags, src),
-        cwd=ROOT,
+        build_command(runner, cc, cflags, src, out_obj),
+        cwd=workdir,
         capture_output=True,
         text=True,
         env=env,
@@ -976,7 +1202,7 @@ def run_compiler(runner: str, cc: Path, cflags: str, src: str) -> subprocess.Com
             if runner == "wine" and line == "wineserver: using server-side synchronization.\n":
                 continue
             print(line, end="", file=sys.stderr)
-    return proc
+    return proc, pcdump
 
 
 def main() -> int:
@@ -998,14 +1224,14 @@ def main() -> int:
         )
 
     runner = "wibo" if args.runner == "auto" else args.runner
-    proc = run_compiler(runner, cc, cflags, src)
+    proc, pcdump = run_compiler(runner, cc, cflags, src, func)
 
     if args.runner == "auto" and proc.returncode == -10:
         print("[mwcc_dump] wibo SIGBUS; retrying with Wine", file=sys.stderr)
-        proc = run_compiler("wine", cc, cflags, src)
+        proc, pcdump = run_compiler("wine", cc, cflags, src, func)
         runner = "wine"
 
-    return finalize_dump(func)
+    return finalize_dump(func, pcdump)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Helper script for LLM-driven decompiling. Fixes any missing imports, runs
-the stack-frame autofix, then rebuilds and runs objdiff-cli on the specified
-function.
+Helper script for LLM-driven decompiling. Fixes any missing imports, rebuilds,
+and runs objdiff-cli on the specified function.
 
 Usage:
   tools/checkdiff.py <function_name>                   # focused diff
   tools/checkdiff.py --full-diff <function_name>       # don't hide matching lines
   tools/checkdiff.py --summary <function_name> [...]   # PASS/FAIL per function
-  tools/checkdiff.py --no-fix-frame <function_name>    # skip the autofix
 
 Without --summary, exactly one function must be given and the diff is printed.
 By default, runs of 5+ matching lines are collapsed into a placeholder, with
@@ -23,7 +21,6 @@ result:
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -46,27 +43,9 @@ SRC_ROOT = ROOT / "src"
 TOOLS = Path(__file__).resolve().parent
 
 
-def auto_fix_frame(func_name: str) -> None:
-    """Run `stack_permute.py --fix-frame` on `func_name`. Modifies the source if
-    a strict improvement is available. Normal output is suppressed; only stderr
-    (errors) is surfaced. For verbose stack-fix output, run stack_permute.py
-    directly."""
-    stack_permute = TOOLS / "stack_permute.py"
-    proc = subprocess.run(
-        [sys.executable, str(stack_permute), func_name, "--fix-frame"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if proc.stderr.strip():
-        print(proc.stderr, file=sys.stderr, end="")
-
-
-def build_unit(
-    obj_path: str, fix_frame_funcs: Optional[list[str]] = None
-) -> Optional[CompiledObject]:
-    """Fix includes, optionally run --fix-frame on each named function, then
-    compile the translation unit. Returns the temporary object on success."""
+def build_unit(obj_path: str) -> Optional[CompiledObject]:
+    """Fix includes, then compile the translation unit.
+    Returns the temporary object on success."""
     c_file = SRC_ROOT / f"{obj_path}.c"
 
     fix_includes = TOOLS / "fix_includes.py"
@@ -79,9 +58,6 @@ def build_unit(
         print(f"fix_includes.py failed:", file=sys.stderr)
         print(result.stderr.decode(), file=sys.stderr)
         return None
-
-    for func_name in (fix_frame_funcs or []):
-        auto_fix_frame(func_name)
 
     return direct_compile(obj_path)
 
@@ -122,12 +98,11 @@ def resolve_functions(func_names: list[str]) -> dict[str, list[str]]:
     return func_units
 
 
-def build_units(func_units: dict[str, list[str]], fix_frame: bool) -> dict[str, CompiledObject]:
-    """Compile each translation unit once. Returns compiled objects by path.
-    If `fix_frame` is True, runs --fix-frame on every function first."""
+def build_units(func_units: dict[str, list[str]]) -> dict[str, CompiledObject]:
+    """Compile each translation unit once. Returns compiled objects by path."""
     built: dict[str, CompiledObject] = {}
-    for obj_path, funcs in func_units.items():
-        compiled = build_unit(obj_path, funcs if fix_frame else None)
+    for obj_path in func_units:
+        compiled = build_unit(obj_path)
         if compiled is not None:
             built[obj_path] = compiled
     return built
@@ -188,14 +163,14 @@ def collapse_matching(output: str) -> str:
     return out
 
 
-def check_single(func_name: str, fix_frame: bool, full_diff: bool) -> int:
+def check_single(func_name: str, full_diff: bool) -> int:
     """Check a single function, printing the full diff."""
     obj_path = find_unit_for_function(func_name)
     if obj_path is None:
         print(f"error: could not find function '{func_name}' in report.json", file=sys.stderr)
         return 1
 
-    compiled = build_unit(obj_path, [func_name] if fix_frame else None)
+    compiled = build_unit(obj_path)
     if compiled is None:
         return 1
 
@@ -207,13 +182,13 @@ def check_single(func_name: str, fix_frame: bool, full_diff: bool) -> int:
     return result.returncode
 
 
-def check_multiple(func_names: list[str], fix_frame: bool) -> int:
+def check_multiple(func_names: list[str]) -> int:
     """Check multiple functions, printing OK/FAIL summary for each."""
     func_units = resolve_functions(func_names)
     if not func_units:
         return 1
 
-    built = build_units(func_units, fix_frame)
+    built = build_units(func_units)
     rc = 0
 
     for obj_path, funcs in func_units.items():
@@ -241,21 +216,18 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-s", "--summary", action="store_true",
                     help="Print PASS/FAIL summary line per function instead of full diff")
-    ap.add_argument("--no-fix-frame", dest="fix_frame", action="store_false",
-                    help="Skip the automatic stack-frame fix that runs after fix_includes.py")
     ap.add_argument("--full-diff", action="store_true",
                     help="Show every diff line, including matching ones (default: collapse runs of 5+)")
-    ap.set_defaults(fix_frame=True)
     ap.add_argument("functions", nargs="+", metavar="function", help="Function name(s)")
     args = ap.parse_args()
 
     if args.summary:
-        return check_multiple(args.functions, fix_frame=args.fix_frame)
+        return check_multiple(args.functions)
 
     if len(args.functions) != 1:
         ap.error("pass exactly one function without --summary, "
                  "or use --summary to get PASS/FAIL lines for multiple functions")
-    return check_single(args.functions[0], fix_frame=args.fix_frame, full_diff=args.full_diff)
+    return check_single(args.functions[0], full_diff=args.full_diff)
 
 
 if __name__ == "__main__":

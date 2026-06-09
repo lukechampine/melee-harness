@@ -12,7 +12,7 @@ description: Decompile individual Melee functions. Use whenever you are decompil
 If they were not already provided to you, locate the .c and .h files that will contain the decompiled source for this function using `rg <function_name>`. Usually, there will be a `/// #function_name` placeholder comment in the .c file, and a declaration in the .h file. After locating the file, check if you have any Skills relating to it (such as `item-decomp` for item-related functions).
 
 > **Invoking the tooling.** All scripts (`decomp.py`, `checkdiff.py`,
-> `stack_permute.py`, `permute.py`, `infer_struct.py`, `mwcc_dump.py`) live
+> `permute.py`, `infer_struct.py`, `mwcc_dump.py`) live
 > in the sibling harness repo and are run **in place** against the melee
 > checkout via `MELEE_ROOT` — there is no symlink/overlay:
 > ```sh
@@ -40,7 +40,7 @@ More likely, you will see a mismatch. Use the diff to reason about why, then edi
 
 **Tip:** If you are decompiling multiple functions, pass `--summary` (or `-s`) along with the function names to `checkdiff.py`. This prints one PASS/FAIL line per function instead of the full diff.
 
-**Tip:** `checkdiff.py` will automatically add any missing header includes. It also attempts to fix (or at least improve) the function's frame size and stack offsets. You can override this behavior by passing `--no-fix-frame`.
+**Tip:** `checkdiff.py` will automatically add any missing header includes before compiling the temporary object.
 
 ### 3. Finish Up
 
@@ -106,20 +106,14 @@ If you get stuck, look around in the file for functions that contain logic simil
 
 ### Brute-forcing matches
 
-One of the most common sources of mismatches is an incorrect frame size, and/or variables being placed at incorrect stack offsets. `checkdiff.py` will fix trivial stack issues automatically; it does so by running `stack_permute.py --fix-frame`. If the stack issues are more complex, you can try fixing them via brute force, with the stack permuter:
-```sh
-MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/stack_permute.py <function name> --timeout 10
-```
-This will attempt various permutations of the stack layout until it finds a match, up to a specified timeout. Note that the permuter is very CPU intensive, and should therefore be used judiciously. Only use it for functions that are close to matching, with the remaining differences mostly relating to stack. Also refrain from setting a timeout longer than 30 seconds.
-
-Other minor mismatches (such as regswaps) can sometimes be resolved by randomly permuting function logic. This is facilitated by the more general `permute.py` script:
+Minor mismatches (such as regswaps) can sometimes be resolved by randomly permuting function logic. This is facilitated by the source-level `permute.py` script:
 ```sh
 MELEE_ROOT=~/melee uv run --project ~/melee-harness ~/melee-harness/tools/permute.py <function name> --timeout 60
 ```
 
 This rapidly tests random permutations of the real source for up to 60 seconds, and stops as soon as it finds a 100% match. It mutates the actual `.c` (preserving macros and formatting), so a find is a real diff: by default (`--apply=match`) it writes a 100% match straight back into the source file. Pass `--apply=never` to only print the diff, or `--apply=always` to also keep a partial improvement.
 
-As with `stack_permute.py`, you should only use the permuter for functions that are close to matching. For example, do not use the permuter when the checkdiff.py output shows additional or missing instructions, as this is likely to be a waste of time. Also refrain from setting a timeout longer than 60 seconds.
+Only use the permuter for functions that are close to matching. For example, do not use the permuter when the checkdiff.py output shows additional or missing instructions, as this is likely to be a waste of time. Also refrain from setting a timeout longer than 60 seconds.
 
 By default, `permute.py` only permutes the specified function. Read its doccomment to learn more advanced invocation patterns, such as permuting helper functions while scoring a caller.
 

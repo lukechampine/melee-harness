@@ -58,6 +58,13 @@ def parse(src: bytes) -> Tree:
 # (start, end, replacement_bytes); start == end means an insertion.
 Edit = Tuple[int, int, bytes]
 
+
+@dataclass(frozen=True)
+class MutationResult:
+    source: bytes
+    pass_name: str
+    edits: List[Edit]
+
 STMT_TYPES = {
     "expression_statement",
     "if_statement",
@@ -77,6 +84,36 @@ COMM_OPS = {b"+", b"*", b"&", b"|", b"^", b"==", b"!="}
 REL_FLIP = {b"<": b">", b">": b"<", b"<=": b">=", b">=": b"<="}
 COMPARE_OPS = COMM_OPS | set(REL_FLIP) | {b"&&", b"||"}
 AUG_OPS = {b"+", b"-", b"*", b"/", b"%", b"&", b"|", b"^", b"<<", b">>"}
+VOLATILE_SCALAR_TYPES = {
+    b"bool", b"BOOL",
+    b"char", b"signed char", b"unsigned char",
+    b"short", b"signed short", b"unsigned short",
+    b"int", b"signed int", b"unsigned int",
+    b"long", b"signed long", b"unsigned long",
+    b"long long", b"signed long long", b"unsigned long long",
+    b"float", b"double",
+    b"s8", b"s16", b"s32", b"s64",
+    b"u8", b"u16", b"u32", b"u64",
+    b"f32", b"f64",
+}
+PRAGMA_WRAPS = [
+    (b"#pragma push\n#pragma dont_inline on\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma dont_inline off\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma auto_inline on\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma auto_inline off\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma global_optimizer off\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma auto_inline off\n#pragma global_optimizer off\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma inline_depth(0)\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma inline_depth(1)\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma inline_depth(2)\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma inline_depth(3)\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma inline_depth(8)\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma peephole off\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma peephole on\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma optimization_level 0\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma fp_contract on\n", b"\n#pragma pop"),
+    (b"#pragma push\n#pragma always_inline on\n", b"\n#pragma pop"),
+]
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +404,446 @@ def p_pad_var_decl(ctx: Ctx) -> Optional[List[Edit]]:
     indent = ctx.src[line_start:anchor.start_byte]
     pad = typ.text + b" " + name + b";\n" + indent
     return [(anchor.start_byte, anchor.start_byte, pad)]
+
+
+def _decl_payload(d: Node) -> Optional[Tuple[Node, Node]]:
+    """Return (type, declarator) for single-declarator declarations."""
+    typ = field(d, "type")
+    if typ is None:
+        return None
+    kids = [c for c in d.named_children
+            if not ((c.start_byte, c.end_byte) == (typ.start_byte, typ.end_byte))]
+    if len(kids) != 1:
+        return None
+    decl = field(kids[0], "declarator") if kids[0].type == "init_declarator" else kids[0]
+    if decl is None:
+        return None
+    return typ, decl
+
+
+def _decl_identifier_node(decl: Node) -> Optional[Node]:
+    if decl.type == "identifier":
+        return decl
+    inner = field(decl, "declarator")
+    return _decl_identifier_node(inner) if inner is not None else None
+
+
+def _same_span(a: Optional[Node], b: Optional[Node]) -> bool:
+    return (
+        a is not None
+        and b is not None
+        and a.start_byte == b.start_byte
+        and a.end_byte == b.end_byte
+    )
+
+
+DECL_SPECIFIER_TYPES = {
+    "attribute_specifier",
+    "ms_call_modifier",
+    "ms_declspec_modifier",
+    "sized_type_specifier",
+    "storage_class_specifier",
+    "type_qualifier",
+}
+
+
+def _single_decl_parts(d: Node) -> Optional[Tuple[Node, Node, Node, Optional[Node]]]:
+    """Return (type, declarator_item, declarator, initializer) for simple locals.
+
+    `declarator_item` is either the declarator itself or the init_declarator
+    wrapper. Storage-class specifiers like `register` are allowed here; callers
+    decide which spellings are safe for their transformation.
+    """
+    typ = field(d, "type")
+    if typ is None:
+        return None
+    kids = [
+        c for c in d.named_children
+        if not _same_span(c, typ) and c.type not in DECL_SPECIFIER_TYPES
+    ]
+    if len(kids) != 1:
+        return None
+    item = kids[0]
+    if item.type == "init_declarator":
+        decl = field(item, "declarator")
+        init = field(item, "value")
+    else:
+        decl = item
+        init = None
+    if decl is None:
+        return None
+    return typ, item, decl, init
+
+
+def _declaration_names(d: Node) -> List[str]:
+    typ = field(d, "type")
+    if typ is None:
+        return []
+    out: List[str] = []
+    for item in d.named_children:
+        if _same_span(item, typ) or item.type in DECL_SPECIFIER_TYPES:
+            continue
+        decl = field(item, "declarator") if item.type == "init_declarator" else item
+        if decl is None:
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is not None:
+            out.append(ident.text.decode())
+    return out
+
+
+def _declaration_name(d: Node) -> Optional[str]:
+    names = _declaration_names(d)
+    return names[0] if len(names) == 1 else None
+
+
+def _line_removal_span(src: bytes, node: Node) -> Tuple[int, int]:
+    """Remove a node's whole source line, including its indentation/newline."""
+    start = src.rfind(b"\n", 0, node.start_byte) + 1
+    end = src.find(b"\n", node.end_byte)
+    if end < 0:
+        end = node.end_byte
+    else:
+        end += 1
+    return start, end
+
+
+def _direct_child_under(node: Node, ancestor: Node) -> Optional[Node]:
+    cur = node
+    while cur.parent is not None and not _same_span(cur.parent, ancestor):
+        cur = cur.parent
+    return cur if _same_span(cur.parent, ancestor) else None
+
+
+def _next_effective_child(parent: Node, child: Node) -> Optional[Node]:
+    seen = False
+    for c in parent.named_children:
+        if _same_span(c, child):
+            seen = True
+            continue
+        if not seen:
+            continue
+        if c.type == "comment":
+            continue
+        return c
+    return None
+
+
+def _is_descendant(node: Node, ancestor: Node) -> bool:
+    cur: Optional[Node] = node
+    while cur is not None:
+        if _same_span(cur, ancestor):
+            return True
+        cur = cur.parent
+    return False
+
+
+def _compound_ancestors(node: Node) -> List[Node]:
+    out: List[Node] = []
+    cur = node.parent
+    while cur is not None:
+        if cur.type == "compound_statement":
+            out.append(cur)
+        cur = cur.parent
+    return out
+
+
+def _innermost_common_compound(nodes: List[Node]) -> Optional[Node]:
+    if not nodes:
+        return None
+    for comp in _compound_ancestors(nodes[0]):
+        if all(_is_descendant(n, comp) for n in nodes):
+            return comp
+    return None
+
+
+def _identifier_occurrences(fn: Node, name: str) -> List[Node]:
+    raw = name.encode()
+    return [
+        n for n in iter_subtree(fn)
+        if n.type == "identifier" and n.text == raw
+    ]
+
+
+def _has_other_declaration(fn: Node, decl: Node, name: str) -> bool:
+    for d in iter_subtree(fn):
+        if d.type != "declaration" or _same_span(d, decl):
+            continue
+        if name in _declaration_names(d):
+            return True
+    return False
+
+
+def _has_node_type(node: Node, typ: str) -> bool:
+    return any(n.type == typ for n in iter_subtree(node))
+
+
+def _prev_nonblank_line(src: bytes, pos: int) -> bytes:
+    end = src.rfind(b"\n", 0, pos)
+    while end >= 0:
+        start = src.rfind(b"\n", 0, end) + 1
+        line = src[start:end].strip()
+        if line:
+            return line
+        end = src.rfind(b"\n", 0, start - 1)
+    return src[:pos].strip()
+
+
+def _next_nonblank_line(src: bytes, pos: int) -> bytes:
+    cur = pos
+    while cur < len(src):
+        end = src.find(b"\n", cur)
+        if end < 0:
+            end = len(src)
+        line = src[cur:end].strip()
+        if line:
+            return line
+        cur = end + 1
+    return b""
+
+
+def _pragma_wrapped(src: bytes, fn: Node) -> bool:
+    return (_prev_nonblank_line(src, fn.start_byte).startswith(b"#pragma")
+            or _next_nonblank_line(src, fn.end_byte).startswith(b"#pragma pop"))
+
+
+def _pragma_targets(ctx: Ctx) -> list[Node]:
+    base = fn_name_of(ctx.fn)
+    if not base:
+        return []
+    helper_prefixes = tuple(f"{base}_{suffix}" for suffix in ("pi", "blk", "inline"))
+    out = []
+    for n in iter_subtree(ctx.root):
+        if n.type != "function_definition":
+            continue
+        name = fn_name_of(n)
+        if name != base and not (name and name.startswith(helper_prefixes)):
+            continue
+        if _pragma_wrapped(ctx.src, n):
+            continue
+        out.append(n)
+    return out
+
+
+def p_pragma_wrap(ctx: Ctx) -> Optional[List[Edit]]:
+    """Scope a known MWCC codegen pragma over this function or extracted inline."""
+    targets = _pragma_targets(ctx)
+    if not targets:
+        return None
+    fn = ctx.rng.choice(targets)
+    pre, post = ctx.rng.choice(PRAGMA_WRAPS)
+    return [(fn.start_byte, fn.start_byte, pre), (fn.end_byte, fn.end_byte, post)]
+
+
+def _is_volatile_scalar_type(typ: Node) -> bool:
+    return b" ".join(typ.text.split()) in VOLATILE_SCALAR_TYPES
+
+
+def p_volatile_decl(ctx: Ctx) -> Optional[List[Edit]]:
+    """Add `volatile` to a local declaration.
+
+    For pointer declarations, insert it at the declarator identifier so the
+    pointer object is volatile (`T* volatile p`), not the pointee (`volatile T*`).
+    """
+    cands: list[Tuple[int, bytes]] = []
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration":
+            continue
+        if d.parent is None or d.parent.type != "compound_statement":
+            continue
+        text = d.text
+        if b"volatile" in text or any(w in text for w in (b"static", b"extern", b"typedef", b"register")):
+            continue
+        payload = _decl_payload(d)
+        if payload is None:
+            continue
+        typ, decl = payload
+        if _has_node_type(decl, "function_declarator"):
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is None:
+            continue
+        if _has_node_type(decl, "pointer_declarator"):
+            cands.append((ident.start_byte, b"volatile "))
+        elif _is_volatile_scalar_type(typ):
+            cands.append((typ.start_byte, b"volatile "))
+    if not cands:
+        return None
+    pos, rep = ctx.rng.choice(cands)
+    return [(pos, pos, rep)]
+
+
+INLINE_TEMP_INIT_BAD_TYPES = {
+    "assignment_expression",
+    "call_expression",
+    "conditional_expression",
+    "update_expression",
+}
+INLINE_TEMP_USE_PARENT_TYPES = {
+    "argument_list",
+    "init_declarator",
+    "parenthesized_expression",
+    "return_statement",
+}
+
+
+def _inline_temp_init_ok(init: Node, name: str) -> bool:
+    raw = name.encode()
+    for n in iter_subtree(init):
+        if n.type in INLINE_TEMP_INIT_BAD_TYPES:
+            return False
+        if n.type == "identifier" and n.text == raw:
+            return False
+    return True
+
+
+def _inline_temp_use_ok(use: Node) -> bool:
+    par = use.parent
+    if par is None or par.type not in INLINE_TEMP_USE_PARENT_TYPES:
+        return False
+    cur = use
+    while cur.parent is not None:
+        anc = cur.parent
+        if anc.type == "sizeof_expression":
+            return False
+        if anc.type == "assignment_expression":
+            lhs = field(anc, "left")
+            if lhs is not None and _is_descendant(cur, lhs):
+                return False
+        if anc.type == "update_expression":
+            return False
+        if anc.type == "pointer_expression":
+            op = field(anc, "operator")
+            arg = field(anc, "argument") or only_named(anc)
+            if op is not None and op.text == b"&" and _same_span(arg, cur):
+                return False
+        if anc.type == "call_expression":
+            callee = field(anc, "function")
+            if callee is not None and _is_descendant(cur, callee):
+                return False
+        if anc.type in STMT_TYPES or anc.type == "declaration":
+            break
+        cur = anc
+    return True
+
+
+def p_inline_single_use_temp(ctx: Ctx) -> Optional[List[Edit]]:
+    """Inline a one-use initialized block local into the following statement.
+
+    This is the inverse of `temp_for_expr` for simple, pure temporaries. It is
+    intentionally local: the declaration must be followed immediately by the
+    statement containing the only read, which avoids most lifetime and
+    evaluation-order traps while covering shapes like `exp_bits` in MSL/math.c.
+    """
+    cands: List[Tuple[Node, Node, Node]] = []
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration":
+            continue
+        parent = d.parent
+        if parent is None or parent.type != "compound_statement":
+            continue
+        if any(w in d.text for w in (b"static", b"extern", b"typedef", b"volatile", b"register")):
+            continue
+        parts = _single_decl_parts(d)
+        if parts is None:
+            continue
+        _typ, _item, decl, init = parts
+        if init is None or _has_node_type(decl, "function_declarator"):
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is None:
+            continue
+        name = ident.text.decode()
+        if _has_other_declaration(ctx.fn, d, name):
+            continue
+        if not _inline_temp_init_ok(init, name):
+            continue
+        occ = _identifier_occurrences(ctx.fn, name)
+        if any(n.start_byte < d.start_byte for n in occ):
+            continue
+        uses = [n for n in occ if n.start_byte >= d.end_byte]
+        if len(uses) != 1:
+            continue
+        use = uses[0]
+        if not _inline_temp_use_ok(use):
+            continue
+        use_stmt = _direct_child_under(use, parent)
+        if use_stmt is None or not _same_span(_next_effective_child(parent, d), use_stmt):
+            continue
+        cands.append((d, init, use))
+
+    if not cands:
+        return None
+    d, init, use = ctx.rng.choice(cands)
+    rm_start, rm_end = _line_removal_span(ctx.src, d)
+    return [(rm_start, rm_end, b""), (use.start_byte, use.end_byte, init.text)]
+
+
+def _block_start_insert_site(src: bytes, comp: Node) -> Optional[Tuple[int, bytes]]:
+    if not comp.named_children:
+        return None
+    first = comp.named_children[0]
+    line_start = src.rfind(b"\n", 0, first.start_byte) + 1
+    if line_start <= comp.start_byte:
+        return None
+    indent = src[line_start:first.start_byte]
+    if indent.strip():
+        return None
+    return line_start, indent
+
+
+def p_sink_decl_to_use_block(ctx: Ctx) -> Optional[List[Edit]]:
+    """Move an uninitialized local declaration into the nested block owning it.
+
+    The pass is deliberately conservative: all occurrences after the original
+    declaration must be inside one later descendant compound block, and there
+    must be no shadowing declaration with the same name.
+    """
+    cands: List[Tuple[Node, int, bytes]] = []
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration":
+            continue
+        parent = d.parent
+        if parent is None or parent.type != "compound_statement":
+            continue
+        if any(w in d.text for w in (b"static", b"extern", b"typedef", b"volatile")):
+            continue
+        parts = _single_decl_parts(d)
+        if parts is None:
+            continue
+        _typ, _item, decl, init = parts
+        if init is not None or _has_node_type(decl, "function_declarator"):
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is None:
+            continue
+        name = ident.text.decode()
+        if _has_other_declaration(ctx.fn, d, name):
+            continue
+        occ = _identifier_occurrences(ctx.fn, name)
+        if any(n.start_byte < d.start_byte for n in occ):
+            continue
+        uses = [n for n in occ if n.start_byte >= d.end_byte]
+        if not uses:
+            continue
+        target = _innermost_common_compound(uses)
+        if target is None or _same_span(target, parent) or not _is_descendant(target, parent):
+            continue
+        if target.start_byte < d.end_byte:
+            continue
+        if target.parent is not None and target.parent.type == "switch_statement":
+            continue
+        site = _block_start_insert_site(ctx.src, target)
+        if site is None:
+            continue
+        insert_pos, indent = site
+        cands.append((d, insert_pos, indent))
+
+    if not cands:
+        return None
+    d, insert_pos, indent = ctx.rng.choice(cands)
+    rm_start, rm_end = _line_removal_span(ctx.src, d)
+    return [(rm_start, rm_end, b""), (insert_pos, insert_pos, indent + d.text + b"\n")]
 
 
 def p_reorder_params(ctx: Ctx) -> Optional[List[Edit]]:
@@ -718,6 +1195,152 @@ def p_inline(ctx: Ctx) -> Optional[List[Edit]]:
     return [(ctx.fn.start_byte, ctx.fn.start_byte, helper), (s, e, call)]
 
 
+def _is_static_inline_void(fn: Node, src: bytes) -> bool:
+    fdecl = function_declarator_of(fn)
+    typ = field(fn, "type")
+    if fdecl is None or typ is None or b" ".join(typ.text.split()) != b"void":
+        return False
+    prefix = src[fn.start_byte:fdecl.start_byte]
+    return b"static" in prefix and b"inline" in prefix
+
+
+def _param_names(fn: Node) -> list[str]:
+    fdecl = function_declarator_of(fn)
+    if fdecl is None:
+        return []
+    plist = field(fdecl, "parameters")
+    if plist is None:
+        return []
+    out: list[str] = []
+    for p in plist.named_children:
+        if p.type != "parameter_declaration":
+            continue
+        nm = _declared_name(p)
+        if nm:
+            out.append(nm)
+    return out
+
+
+def _call_name(call: Node) -> Optional[str]:
+    f = field(call, "function")
+    return f.text.decode() if f is not None and f.type == "identifier" else None
+
+
+def _simple_inline_arg(arg: Node) -> bool:
+    return arg.type == "identifier"
+
+
+def _manual_inline_body_safe(body: Node, params: set[str]) -> bool:
+    for n in iter_subtree(body):
+        if n.type.startswith("preproc_"):
+            return False
+        if n.type in ("return_statement", "goto_statement", "labeled_statement",
+                      "break_statement", "continue_statement"):
+            return False
+        if n.type == "declaration":
+            ty = field(n, "type")
+            for c in n.named_children:
+                if ty is not None and (c.start_byte, c.end_byte) == (ty.start_byte, ty.end_byte):
+                    continue
+                if (_declared_name(c) or "") in params:
+                    return False
+    return True
+
+
+def _reindent_manual_inline(body_text: bytes, indent: bytes) -> bytes:
+    lines = body_text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return b"{\n" + indent + b"}"
+
+    def nindent(line: bytes) -> int:
+        return len(line) - len(line.lstrip(b" \t"))
+
+    base = min(nindent(line) for line in lines if line.strip())
+    out = [b"{"]
+    for line in lines:
+        if line.strip():
+            out.append(indent + b"    " + line[base:])
+        else:
+            out.append(b"")
+    out.append(indent + b"}")
+    return b"\n".join(out)
+
+
+def _manual_inline_sites(ctx: Ctx):
+    helpers: dict[str, Tuple[Node, list[str]]] = {}
+    for n in iter_subtree(ctx.root):
+        if n.type != "function_definition" or n.start_byte == ctx.fn.start_byte:
+            continue
+        if not _is_static_inline_void(n, ctx.src):
+            continue
+        name = fn_name_of(n)
+        body = body_of(n)
+        if name is None or body is None:
+            continue
+        params = _param_names(n)
+        if not _manual_inline_body_safe(body, set(params)):
+            continue
+        helpers[name] = (n, params)
+
+    if not helpers:
+        return
+
+    for call in iter_subtree(ctx.fn):
+        if call.type != "call_expression":
+            continue
+        name = _call_name(call)
+        if name not in helpers:
+            continue
+        stmt = call.parent
+        if stmt is None or stmt.type != "expression_statement":
+            continue
+        inner = only_named(stmt)
+        if inner is None or inner.start_byte != call.start_byte or inner.end_byte != call.end_byte:
+            continue
+        helper, params = helpers[name]
+        alist = field(call, "arguments")
+        args = [c for c in alist.named_children] if alist is not None else []
+        if len(args) != len(params) or any(not _simple_inline_arg(a) for a in args):
+            continue
+
+        hbody = body_of(helper)
+        if hbody is None:
+            continue
+        inner_start, inner_end = hbody.start_byte + 1, hbody.end_byte - 1
+        body_text = bytearray(ctx.src[inner_start:inner_end])
+        subst = {p: a.text for p, a in zip(params, args)}
+        edits: List[Edit] = []
+        for n in iter_subtree(hbody):
+            if n.type != "identifier" or n.start_byte < inner_start or n.end_byte > inner_end:
+                continue
+            rep = subst.get(n.text.decode())
+            if rep is not None:
+                edits.append((n.start_byte - inner_start, n.end_byte - inner_start, rep))
+        for s0, e0, rep in sorted(edits, key=lambda x: x[0], reverse=True):
+            body_text[s0:e0] = rep
+
+        line_start = ctx.src.rfind(b"\n", 0, stmt.start_byte) + 1
+        indent = ctx.src[line_start:stmt.start_byte]
+        yield (stmt.start_byte, stmt.end_byte,
+               _reindent_manual_inline(bytes(body_text), indent))
+
+
+def p_manual_inline(ctx: Ctx) -> Optional[List[Edit]]:
+    """Replace a whole-statement call to a same-TU `static inline void` helper
+    with the helper body in a scoped block. This is the inverse of the helper
+    extraction passes, kept conservative so argument substitution stays textual
+    and behaviour-preserving."""
+    sites = list(_manual_inline_sites(ctx))
+    if not sites:
+        return None
+    s, e, rep = ctx.rng.choice(sites)
+    return [(s, e, rep)]
+
+
 def _storage_base(lv: Optional[Node]) -> Optional[str]:
     """Variable whose own storage a write to `lv` modifies, or None if the path
     dereferences a pointer (-> or *) -- then a pointee changes, not a local."""
@@ -839,6 +1462,127 @@ def _decl_spell_map(fn: Node, src: bytes) -> dict:
     return out
 
 
+def _is_pointer_spell(spell: bytes) -> bool:
+    return b"*" in spell and b"volatile" not in spell
+
+
+def _noop_param_names(fn: Node) -> list[Tuple[str, bytes]]:
+    out: list[Tuple[str, bytes]] = []
+    fdecl = function_declarator_of(fn)
+    if fdecl is None:
+        return out
+    plist = field(fdecl, "parameters")
+    if plist is None:
+        return out
+    for p in plist.named_children:
+        if p.type != "parameter_declaration":
+            continue
+        nm = _declared_name(p)
+        if nm and _is_pointer_spell(p.text):
+            out.append((nm, p.text))
+    return out
+
+
+def _noop_decl_name(d: Node, src: bytes) -> Optional[Tuple[str, bytes]]:
+    """A pointer local that is safe to read in a synthetic empty branch.
+
+    Only single-declarator declarations with initializers are used; uninitialized
+    locals would either fail MWCC's definite-assignment checks or introduce a
+    real undefined read.
+    """
+    ty = field(d, "type")
+    kids = [c for c in d.named_children
+            if not (ty is not None
+                    and (c.start_byte, c.end_byte) == (ty.start_byte, ty.end_byte))]
+    if len(kids) != 1 or kids[0].type != "init_declarator":
+        return None
+    init = field(kids[0], "value")
+    inner = field(kids[0], "declarator")
+    nm = _declared_name(kids[0])
+    if init is None or inner is None or nm is None:
+        return None
+    spell = src[d.start_byte:inner.end_byte]
+    if not _is_pointer_spell(spell):
+        return None
+    return nm, spell
+
+
+def _noop_visible_names(ctx: Ctx, pos: int) -> list[str]:
+    """Pointer params/initialized locals visible at byte position `pos`."""
+    params: list[str] = []
+    locals_: list[str] = []
+    seen_params = set()
+    for nm, _spell in _noop_param_names(ctx.fn):
+        if nm not in seen_params:
+            seen_params.add(nm)
+            params.append(nm)
+
+    seen_locals = set()
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration" or d.end_byte > pos:
+            continue
+        parent = d.parent
+        if parent is None or parent.type != "compound_statement":
+            continue
+        if not (parent.start_byte <= pos < parent.end_byte):
+            continue
+        item = _noop_decl_name(d, ctx.src)
+        if item is None:
+            continue
+        nm, _spell = item
+        if nm not in seen_locals:
+            seen_locals.add(nm)
+            locals_.append(nm)
+    return locals_ or params
+
+
+def _noop_insert_sites(ctx: Ctx):
+    """Yield (insert_pos, indent, needs_leading_newline)."""
+    for comp in iter_subtree(ctx.fn):
+        if comp.type != "compound_statement":
+            continue
+        stmts = [c for c in comp.named_children if c.type in STMT_TYPES]
+        for stmt in stmts:
+            line_start = ctx.src.rfind(b"\n", 0, stmt.start_byte) + 1
+            indent = ctx.src[line_start:stmt.start_byte]
+            yield stmt.start_byte, indent, False
+            yield stmt.end_byte, indent, True
+        if stmts:
+            continue
+        close = comp.end_byte - 1
+        if close <= comp.start_byte or ctx.src[close:close + 1] != b"}":
+            continue
+        line_start = ctx.src.rfind(b"\n", 0, close) + 1
+        if line_start <= comp.start_byte:
+            continue
+        indent = ctx.src[line_start:close]
+        yield close, indent, False
+
+
+def p_noop_branch(ctx: Ctx) -> Optional[List[Edit]]:
+    """Insert an empty branch that only reads an already-initialized pointer.
+
+    These no-op branches sometimes perturb MWCC's allocation/branch layout, and
+    match real shapes like `if (p != NULL) {}` or nested empty checks.
+    """
+    sites = []
+    for pos, indent, leading_newline in _noop_insert_sites(ctx):
+        names = _noop_visible_names(ctx, pos)
+        if names:
+            sites.append((pos, indent, leading_newline, names))
+    if not sites:
+        return None
+    pos, indent, leading_newline, names = ctx.rng.choice(sites)
+    name = ctx.rng.choice(names).encode()
+    op = ctx.rng.choice([b"!= NULL", b"!= 0", b"== NULL", b"== 0"])
+    stmt = b"if (" + name + b" " + op + b") {\n" + indent + b"}"
+    if leading_newline:
+        stmt = b"\n" + indent + stmt
+    else:
+        stmt = stmt + b"\n" + indent
+    return [(pos, pos, stmt)]
+
+
 def _run_local(order: List[str], occ: dict, fn: Node, run_end: int) -> set:
     """Outer locals whose first use in the run is a plain `nm = ...` full
     (re)definition and which are never read after the run -- pure run
@@ -918,10 +1662,8 @@ def _block_site(ctx: Ctx, run: List[Node], locals_: set, fname: str,
             if lv is None:
                 continue
             base = _storage_base(lv)
-            if base in order:
-                t = _occ_type(occ[base], ctx.types)
-                if t and not t.rstrip().endswith("*"):
-                    out.add(base)
+            if base in order and _occ_type(occ[base], ctx.types):
+                out.add(base)
 
     ptypes: dict = {}
     for nm in order:
@@ -1026,9 +1768,9 @@ def _block_inline_sites(ctx: Ctx):
 def p_inline_block(ctx: Ctx) -> Optional[List[Edit]]:
     """Extract a contiguous run of statements into a `static inline void` helper
     -- the `it_NNNN_inline_N(gobj, arg1, &pos)` shape. Reads of outer locals
-    become by-value params; non-pointer locals whose storage the run writes
-    become pointer out-params (uses rewritten to `(*v)`, call passes `&v`);
-    nested declarations stay helper-local. Needs types -> base steps only."""
+    become by-value params; outer locals whose storage the run writes become
+    pointer out-params (uses rewritten to `(*v)`, call passes `&v`); nested
+    declarations stay helper-local. Needs types -> base steps only."""
     sites = list(_block_inline_sites(ctx))
     if not sites:
         return None
@@ -1069,15 +1811,21 @@ PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("temp_for_expr", p_temp_for_expr, 16.0),
     ("inline", p_inline, 12.0),
     ("inline_block", p_inline_block, 12.0),
+    ("manual_inline", p_manual_inline, 12.0),
     ("multi_inline", p_multi_inline, 10.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
+    ("sink_decl_to_use_block", p_sink_decl_to_use_block, 8.0),
+    ("inline_single_use_temp", p_inline_single_use_temp, 8.0),
     ("reorder_params", p_reorder_params, 6.0),
     ("commutative", p_commutative, 5.0),
     ("add_sub", p_add_sub, 5.0),
     ("struct_ref", p_struct_ref, 5.0),
     ("compound_assignment", p_compound_assignment, 4.0),
+    ("pragma_wrap", p_pragma_wrap, 4.0),
+    ("volatile_decl", p_volatile_decl, 4.0),
     ("condition", p_condition, 4.0),
+    ("noop_branch", p_noop_branch, 4.0),
     ("remove_cast", p_remove_cast, 3.0),
     ("pad_var_decl", p_pad_var_decl, 2.0),
 ]
@@ -1106,6 +1854,18 @@ class Mutator:
         fn: Optional[Node] = None,
         types: Optional[dict] = None,
     ) -> Optional[bytes]:
+        result = self.step_result(src, rng, tree=tree, fn=fn, types=types)
+        return result.source if result is not None else None
+
+    def step_result(
+        self,
+        src: bytes,
+        rng: random.Random,
+        *,
+        tree: Optional[Tree] = None,
+        fn: Optional[Node] = None,
+        types: Optional[dict] = None,
+    ) -> Optional[MutationResult]:
         # `tree`/`fn` let a caller pass a pre-parsed tree for `src` (e.g. the
         # cached parse of the unchanged base source), avoiding a re-parse +
         # find_function on the hot path. They must correspond to `src`.
@@ -1140,11 +1900,16 @@ class Mutator:
             except ValueError:
                 continue
             if new != src:
-                return new
+                return MutationResult(source=new, pass_name=_name, edits=edits)
         return None
 
     def step_named(self, src: bytes, name: str, rng: random.Random,
                    types: Optional[dict] = None) -> Optional[bytes]:
+        result = self.step_named_result(src, name, rng, types=types)
+        return result.source if result is not None else None
+
+    def step_named_result(self, src: bytes, name: str, rng: random.Random,
+                          types: Optional[dict] = None) -> Optional[MutationResult]:
         """Run exactly one pass by name (debugging)."""
         tree = parse(src)
         fn = find_function(tree.root_node, self.fn_name)
@@ -1155,7 +1920,10 @@ class Mutator:
                 edits = f(Ctx(src, tree.root_node, fn, rng, types))
                 if not edits:
                     return None
-                return apply_edits(src, edits)
+                new = apply_edits(src, edits)
+                if new == src:
+                    return None
+                return MutationResult(source=new, pass_name=n, edits=edits)
         raise SystemExit(f"unknown pass: {name}")
 
 
