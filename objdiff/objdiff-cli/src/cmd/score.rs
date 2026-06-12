@@ -129,6 +129,7 @@ fn summarize_mismatches(
 
     let mut out = ScoreBreakdown::default();
     let mut seen_regswaps = HashSet::<(String, String)>::new();
+    let mut frame_counted = false;
     let rows = target_diff
         .instruction_rows
         .len()
@@ -144,6 +145,7 @@ fn summarize_mismatches(
             frame_diff,
             diff_config,
             &mut seen_regswaps,
+            &mut frame_counted,
             &mut out,
         );
     }
@@ -160,6 +162,7 @@ fn classify_row(
     frame_diff: i64,
     diff_config: &DiffObjConfig,
     seen_regswaps: &mut HashSet<(String, String)>,
+    frame_counted: &mut bool,
     out: &mut ScoreBreakdown,
 ) {
     let kind = match (target_row, base_row) {
@@ -201,13 +204,19 @@ fn classify_row(
                 return;
             };
 
-            if frame_diff != 0
-                && !is_stwu_r1(&t_parsed)
-                && !is_stwu_r1(&b_parsed)
-                && is_stack_shift(&t_parsed, &b_parsed, tr, br, frame_diff)
-            {
-                out.stack += 1;
-                return;
+            // Frame cascade (incl. the prologue stwu, which moves by
+            // -frame_diff): one logical mismatch, counted once -- mirrors
+            // the two-column display's collapsing.
+            if frame_diff != 0 {
+                let stwu = is_stwu_r1(&t_parsed) || is_stwu_r1(&b_parsed);
+                let shift = if stwu { -frame_diff } else { frame_diff };
+                if is_stack_shift(&t_parsed, &b_parsed, tr, br, shift) {
+                    if !*frame_counted {
+                        *frame_counted = true;
+                        out.stack += 1;
+                    }
+                    return;
+                }
             }
 
             let references_r1 = t_parsed.args.iter().any(is_r1) || b_parsed.args.iter().any(is_r1);

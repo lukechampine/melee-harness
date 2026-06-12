@@ -68,18 +68,24 @@ def run_diff(
     func_name: str,
     fmt: str = "two-column",
     capture: bool = False,
+    all_frame_shifts: bool = False,
 ):
-    """Run objdiff-cli. Returns CompletedProcess."""
+    """Run objdiff-cli. Returns CompletedProcess.
+
+    `all_frame_shifts` marks every frame-cascade row instead of collapsing the
+    uniform shift into one mismatch (used by diagnostics that need the full
+    offset table, e.g. mwcc_diagnose's stack mode)."""
     ref_obj = f"./build/GALE01/obj/{obj_path}.o"
+    cmd = [
+        objdiff_cli(), "diff",
+        "--format", fmt,
+        "-c", "functionRelocDiffs=data_value",
+    ]
+    if all_frame_shifts:
+        cmd.append("--all-frame-shifts")
+    cmd += ["-1", ref_obj, "-2", str(candidate_obj), func_name]
     return subprocess.run(
-        [
-            objdiff_cli(), "diff",
-            "--format", fmt,
-            "-c", "functionRelocDiffs=data_value",
-            "-1", ref_obj,
-            "-2", str(candidate_obj),
-            func_name,
-        ],
+        cmd,
         cwd=ROOT,
         capture_output=capture,
         text=capture,
@@ -191,8 +197,9 @@ def check_single(func_name: str, full_diff: bool) -> int:
         print(result.stderr, file=sys.stderr, end="")
     rc = result.returncode
     if rc == 0 and has_mismatch(result.stdout):
-        print("note: percent rounds up to 100.00 but mismatched rows remain; "
-              "this is NOT a match", file=sys.stderr)
+        if result.stdout.startswith("100.00%"):
+            print("note: percent rounds up to 100.00 but mismatched rows "
+                  "remain; this is NOT a match", file=sys.stderr)
         rc = 1
     return rc
 

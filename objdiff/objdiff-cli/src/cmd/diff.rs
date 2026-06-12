@@ -111,6 +111,9 @@ pub struct Args {
     #[argp(switch)]
     /// In two-column output, mark every register substitution row instead of only the first occurrence of each (left, right) pair.
     all_regswaps: bool,
+    #[argp(switch)]
+    /// In two-column output, mark every frame-cascade row instead of collapsing the uniform shift into one mismatch.
+    all_frame_shifts: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -878,6 +881,7 @@ fn run_two_column_output(
     let mut right_lines: Vec<String> = Vec::with_capacity(num_rows);
     let mut markers: Vec<String> = Vec::with_capacity(num_rows);
     let mut seen_swaps: HashSet<(String, String)> = HashSet::new();
+    let mut frame_collapsed = false;
 
     for i in 0..num_rows {
         let tr = target_rows.get(i);
@@ -893,6 +897,8 @@ fn run_two_column_output(
             &diff_obj_config,
             &mut seen_swaps,
             !args.all_regswaps,
+            !args.all_frame_shifts,
+            &mut frame_collapsed,
         );
         let render = |obj: &Object, sym: usize, row: &InstructionDiffRow| -> String {
             let literal = if marker.contains('d')
@@ -1037,6 +1043,8 @@ fn compute_marker(
     diff_config: &DiffObjConfig,
     seen_swaps: &mut HashSet<(String, String)>,
     dedup_regswaps: bool,
+    collapse_frame_shifts: bool,
+    frame_collapsed: &mut bool,
 ) -> String {
     let kind = match (target_row, base_row) {
         (Some(tr), Some(br)) => {
@@ -1083,15 +1091,22 @@ fn compute_marker(
             };
 
             // Frame-cascade detection: r1-relative row whose differing
-            // constants all move uniformly with frame_diff. Excludes the
-            // prologue stwu (its math goes the other way).
+            // constants all move uniformly with frame_diff (the prologue
+            // stwu moves by -frame_diff). The whole cascade is ONE logical
+            // mismatch -- the frame size -- so only its first row is
+            // flagged; the rest render unmarked, like deduped regswaps.
             if let Some(frame_diff) = frame_diff
                 && frame_diff != 0
-                && !is_stwu_r1(&t_parsed)
-                && !is_stwu_r1(&b_parsed)
-                && is_stack_shift(&t_parsed, &b_parsed, tr, br, frame_diff)
             {
-                return "f".into();
+                let stwu = is_stwu_r1(&t_parsed) || is_stwu_r1(&b_parsed);
+                let shift = if stwu { -frame_diff } else { frame_diff };
+                if is_stack_shift(&t_parsed, &b_parsed, tr, br, shift) {
+                    if *frame_collapsed && collapse_frame_shifts {
+                        return " ".into();
+                    }
+                    *frame_collapsed = true;
+                    return "f".into();
+                }
             }
 
             let references_r1 =
