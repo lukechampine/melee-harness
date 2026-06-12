@@ -843,6 +843,7 @@ def print_profile(sh: Shared, elapsed: float, jobs: int) -> None:
 
 
 def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
+           frame_mutators: Dict[str, "src_mutate.Mutator"],
            mutate_fns: List[str], seed: int) -> None:
     rng = random.Random(seed)
     scorer = make_scorer(sh.unit, sh.fn)
@@ -888,11 +889,19 @@ def worker(sh: Shared, mutators: Dict[str, "src_mutate.Mutator"],
                     cur = a_src
                     cur_trace = a_trace
                 mfn = rng.choice(mutate_fns)
+                # When only stack/frame rows remain, bias toward the pad
+                # mutations -- a frame-size delta should always be getting
+                # direct PAD_STACK/pad-array attempts.
+                ak = sh.anchor_key
+                pool = frame_mutators if (
+                    ak is not None and ak.breakdown
+                    and ak.hard == 0 and ak.regswap == 0 and ak.stack > 0
+                ) else mutators
                 if cur is a_src:
-                    result = mutators[mfn].step_result(cur, rng, tree=a_tree,
-                                                       fn=a_fns[mfn], types=a_types)
+                    result = pool[mfn].step_result(cur, rng, tree=a_tree,
+                                                   fn=a_fns[mfn], types=a_types)
                 else:
-                    result = mutators[mfn].step_result(cur, rng)
+                    result = pool[mfn].step_result(cur, rng)
                 if result is None:
                     n_none += 1
                     cur = a_src
@@ -1150,13 +1159,19 @@ def main() -> int:
     base_source = c_file.read_bytes()
 
     # Validate mutate targets exist in this TU, and build per-function mutators.
+    # The "frame" twins boost the pad mutations; workers switch to them whenever
+    # the anchor's remaining mismatch is purely stack/frame rows, so a frame-size
+    # delta is always being attacked directly.
     tree = src_mutate.parse(base_source)
     mutators: Dict[str, src_mutate.Mutator] = {}
+    frame_mutators: Dict[str, src_mutate.Mutator] = {}
     for mfn in mutate_fns:
         if src_mutate.find_function(tree.root_node, mfn) is None:
             print(f"error: function '{mfn}' not found in {c_file}", file=sys.stderr)
             return 1
         mutators[mfn] = src_mutate.Mutator(mfn)
+        frame_mutators[mfn] = src_mutate.Mutator(
+            mfn, weights={"pad_stack": 24.0, "pad_var_decl": 4.0})
 
     # Baseline: compile the unmodified real source and score it.
     scorer = make_scorer(unit, fn)
@@ -1237,7 +1252,8 @@ def main() -> int:
     prev_sigint = signal.signal(signal.SIGINT, lambda *_: sh.stop.set())
 
     threads = [
-        threading.Thread(target=worker, args=(sh, mutators, mutate_fns,
+        threading.Thread(target=worker, args=(sh, mutators, frame_mutators,
+                                               mutate_fns,
                                                args.seed * 1000 + i), daemon=True)
         for i in range(args.jobs)
     ]

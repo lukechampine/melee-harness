@@ -552,6 +552,84 @@ def p_pad_var_decl(ctx: Ctx) -> Optional[List[Edit]]:
     return [(anchor.start_byte, anchor.start_byte, pad)]
 
 
+PAD_STACK_INSERT_SIZES = (4, 8, 12, 16)
+
+
+def p_pad_stack(ctx: Ctx) -> Optional[List[Edit]]:
+    """Frame-size levers: insert a PAD_STACK(N), resize/remove an existing one,
+    or resize a `u8 _pad[N]`-style pad array. Unlike p_pad_var_decl's dummy
+    scalar (usually dead-code-eliminated), these actually move the frame."""
+    body = body_of(ctx.fn)
+    if body is None:
+        return None
+    cands: List[List[Edit]] = []
+    has_pad_stack = False
+
+    for n in iter_subtree(ctx.fn):
+        if n.type == "call_expression":
+            f = field(n, "function")
+            args = field(n, "arguments")
+            if f is None or f.text != b"PAD_STACK" or args is None:
+                continue
+            sizes = [c for c in args.named_children if c.type == "number_literal"]
+            if len(sizes) != 1:
+                continue
+            has_pad_stack = True
+            try:
+                cur = int(sizes[0].text)
+            except ValueError:
+                continue
+            span = (sizes[0].start_byte, sizes[0].end_byte)
+            for new in (cur - 8, cur - 4, cur + 4, cur + 8):
+                if new > 0 and new != cur:
+                    cands.append([(span[0], span[1], str(new).encode())])
+            # removal: take out the whole statement line
+            stmt = n.parent if n.parent is not None and \
+                n.parent.type == "expression_statement" else n
+            s, e = _line_removal_span(ctx.src, stmt)
+            cands.append([(s, e, b"")])
+        elif n.type == "array_declarator":
+            decl = n.parent
+            while decl is not None and decl.type != "declaration":
+                decl = decl.parent
+            if decl is None or not _is_descendant(decl, body):
+                continue
+            name = field(n, "declarator")
+            size = field(n, "size")
+            if name is None or size is None or size.type != "number_literal":
+                continue
+            lname = name.text.lower()
+            if not (lname.startswith(b"_") or b"pad" in lname):
+                continue
+            try:
+                cur = int(size.text)
+            except ValueError:
+                continue
+            typ = field(decl, "type")
+            step = 4 if typ is not None and typ.text in (b"u8", b"char", b"s8") else 1
+            for new in (cur - step, cur + step):
+                if new > 0 and new != cur:
+                    cands.append([(size.start_byte, size.end_byte,
+                                   str(new).encode())])
+
+    if not has_pad_stack:
+        decls = declarations(body)
+        anchor = decls[-1] if decls else None
+        if anchor is not None:
+            nl = ctx.src.find(b"\n", anchor.end_byte)
+            if nl != -1:
+                line_start = ctx.src.rfind(b"\n", 0, anchor.start_byte) + 1
+                indent = ctx.src[line_start:anchor.start_byte]
+                if not indent.strip():
+                    for size in PAD_STACK_INSERT_SIZES:
+                        cands.append([(nl + 1, nl + 1,
+                                       indent + b"PAD_STACK(%d);\n" % size)])
+
+    if not cands:
+        return None
+    return ctx.rng.choice(cands)
+
+
 def _decl_payload(d: Node) -> Optional[Tuple[Node, Node]]:
     """Return (type, declarator) for single-declarator declarations."""
     typ = field(d, "type")
@@ -1974,6 +2052,7 @@ PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("condition", p_condition, 4.0),
     ("noop_branch", p_noop_branch, 4.0),
     ("remove_cast", p_remove_cast, 3.0),
+    ("pad_stack", p_pad_stack, 3.0),
     ("pad_var_decl", p_pad_var_decl, 2.0),
 ]
 
