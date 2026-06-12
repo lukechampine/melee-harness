@@ -459,6 +459,46 @@ def _revert_edit(base: bytes, cand: bytes, edit: NarrowEdit) -> bytes:
     )
 
 
+def _changed_cand_lines(base: bytes, cand: bytes) -> Set[int]:
+    """0-based indices of candidate lines that differ from the base source."""
+    base_lines = base.splitlines(keepends=True)
+    cand_lines = cand.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(None, base_lines, cand_lines, autojunk=False)
+    changed: Set[int] = set()
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "insert"):
+            changed.update(range(j1, j2))
+    return changed
+
+
+def _simplify_cast_edits(base: bytes, cand: bytes) -> List[Tuple[int, int, bytes, str]]:
+    """Cleanup candidates for the narrowing simplify stage: drop a cast (plus a
+    paren wrapper enclosing exactly the cast) that sits on a mutated line --
+    e.g. the gobj_accessor expansion's `((Item*) gobj->user_data)` initializer,
+    where the cast is redundant. Whether it really is redundant is decided by
+    the compile + score gate, not syntactically. Returns (start, end,
+    replacement, note) tuples sorted by position."""
+    changed = _changed_cand_lines(base, cand)
+    if not changed:
+        return []
+    tree = src_mutate.parse(cand)
+    out: List[Tuple[int, int, bytes, str]] = []
+    for n in src_mutate.iter_subtree(tree.root_node):
+        if n.type != "cast_expression" or n.start_point[0] not in changed:
+            continue
+        value = src_mutate.field(n, "value")
+        if value is None:
+            continue
+        target = n
+        parent = n.parent
+        if parent is not None and parent.type == "parenthesized_expression":
+            target = parent
+        out.append((target.start_byte, target.end_byte, value.text,
+                    f"drop cast at line {n.start_point[0] + 1}"))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
 def _compile_and_score_source(
     unit: str, scorer: ObjdiffScorer, source: bytes
 ) -> tuple[Optional[ScoreKey], str]:
@@ -577,6 +617,60 @@ def narrow_best_source(
                     show_progress(granularity, pass_idx, edit_idx, edit_count)
                 if accepted_this_pass == 0:
                     break
+
+        # Simplify stage: not a revert -- try dropping casts the mutations
+        # introduced (e.g. gobj_accessor's `((Item*) gobj->user_data)` where
+        # the context makes the cast redundant). Accepted only when the score
+        # is preserved, like any other narrowing edit.
+        for pass_idx in range(1, max_passes + 1):
+            cast_edits = _simplify_cast_edits(base_source, current)
+            if not cast_edits:
+                break
+            accepted_this_pass = 0
+            stats.passes += 1
+            edit_count = len(cast_edits)
+            show_progress("simplify", pass_idx, 0, edit_count, force=True)
+            for edit_idx, (start, end, rep, note) in enumerate(
+                    reversed(cast_edits), start=1):
+                trial = current[:start] + rep + current[end:]
+                if trial == current:
+                    continue
+                stats.attempts += 1
+                show_progress("simplify", pass_idx, edit_idx, edit_count)
+                try:
+                    key, status = _compile_and_score_source(unit, scorer, trial)
+                except OSError as e:
+                    clear_progress()
+                    print(f"narrow: score server stopped ({e}); aborting",
+                          file=sys.stderr)
+                    return current, current_key, stats, current_trace
+                if status == "compile":
+                    stats.compile_failed += 1
+                    show_progress("simplify", pass_idx, edit_idx, edit_count)
+                    continue
+                if status == "score" or key is None:
+                    stats.score_errors += 1
+                    show_progress("simplify", pass_idx, edit_idx, edit_count)
+                    continue
+                if key <= current_key:
+                    current_trace = current_trace + (
+                        make_replay_step(
+                            kind="narrow",
+                            mutate_fn=None,
+                            pass_name="simplify_cast",
+                            before=current,
+                            edits=[(start, end, rep)],
+                            after=trial,
+                            note=note,
+                        ),
+                    )
+                    current = trial
+                    current_key = key
+                    stats.accepted += 1
+                    accepted_this_pass += 1
+                show_progress("simplify", pass_idx, edit_idx, edit_count)
+            if accepted_this_pass == 0:
+                break
     finally:
         clear_progress()
         scorer.close()

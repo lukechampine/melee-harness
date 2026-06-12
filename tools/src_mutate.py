@@ -345,6 +345,152 @@ def p_struct_ref(ctx: Ctx) -> Optional[List[Edit]]:
     return [(n.start_byte, n.end_byte, a.text + b"->" + fld.text)]
 
 
+# Accessor-macro idiom table (it/inlines.h, ft/inlines.h, gr/inlines.h,
+# ef/inlines.h, ty/inlines.h, baselib/gobj.h). The macro forms route through
+# the HSD_GObjGetUserData / HSD_GObjGetHSDObj static inlines; the direct field
+# form compiles to the SAME instructions but without an inline instance, which
+# shifts MWCC's web numbering and frame reservations -- a proven match lever
+# (itseakneedlethrown UnkMotion0/1_Coll).
+GOBJ_ACCESSOR_MACROS = {
+    b"GET_ITEM": (b"Item*", b"user_data"),
+    b"GET_FIGHTER": (b"Fighter*", b"user_data"),
+    b"GET_GROUND": (b"Ground*", b"user_data"),
+    b"GET_EFFECT": (b"EF_Effect*", b"user_data"),
+    b"GET_TOY": (b"Toy*", b"user_data"),
+    b"GET_JOBJ": (b"HSD_JObj*", b"hsd_obj"),
+    b"GET_COBJ": (b"HSD_CObj*", b"hsd_obj"),
+    b"GET_LOBJ": (b"HSD_LObj*", b"hsd_obj"),
+    b"GET_FOG": (b"HSD_Fog*", b"hsd_obj"),
+}
+
+# Bare inline-accessor calls expand the same way (forward only; the reverse
+# direction always produces the macro form).
+GOBJ_ACCESSOR_INLINES = {
+    b"HSD_GObjGetUserData": b"user_data",
+    b"HSD_GObjGetHSDObj": b"hsd_obj",
+}
+
+# gobj argument type spelling -> macro for a bare `->user_data` access
+_USER_DATA_MACRO_BY_GOBJ_TYPE = [
+    (b"Item_GObj", b"GET_ITEM"),
+    (b"Fighter_GObj", b"GET_FIGHTER"),
+    (b"Ground_GObj", b"GET_GROUND"),
+]
+
+
+def _paren_arg(arg: Node) -> bytes:
+    if arg.type in ("identifier", "parenthesized_expression", "call_expression",
+                    "field_expression"):
+        return arg.text
+    return b"(" + arg.text + b")"
+
+
+def _same_node_span(a: Optional[Node], b: Node) -> bool:
+    return a is not None and a.start_byte == b.start_byte and a.end_byte == b.end_byte
+
+
+def _user_data_macro_from_decl(n: Node) -> Optional[bytes]:
+    """For `Item* ip = gobj->user_data;`-style inits, pick the macro from the
+    declared type."""
+    a = n.parent
+    while a is not None and a.type not in (
+            "declaration", "compound_statement", "function_definition"):
+        a = a.parent
+    if a is None or a.type != "declaration":
+        return None
+    t = field(a, "type")
+    if t is None:
+        return None
+    for mac, (typ, fld) in GOBJ_ACCESSOR_MACROS.items():
+        if fld == b"user_data" and typ.rstrip(b"*") == t.text:
+            return mac
+    return None
+
+
+def _gobj_field_to_macro(ctx: Ctx, n: Node) -> Optional[List[Edit]]:
+    """Reverse direction: `x->user_data` / `x->hsd_obj` (optionally wrapped in
+    a matching cast) -> accessor macro call."""
+    op, arg, fld = field(n, "operator"), field(n, "argument"), field(n, "field")
+    if op is None or arg is None or fld is None or op.text != b"->":
+        return None
+    if fld.text not in (b"user_data", b"hsd_obj"):
+        return None
+    p = n.parent
+    if p is not None:
+        # a cast result is not an lvalue: skip stores and address-taking
+        if p.type == "assignment_expression" and _same_node_span(field(p, "left"), n):
+            return None
+        if p.type == "pointer_expression":
+            return None
+        # already a macro argument? (GET_ITEM(x)->user_data is fine; but do not
+        # touch the inside of an expansion we just generated this step)
+    if p is not None and p.type == "cast_expression":
+        ctyp = field(p, "type")
+        if ctyp is None:
+            return None
+        norm = ctyp.text.replace(b" ", b"")
+        for mac, (typ, mfld) in GOBJ_ACCESSOR_MACROS.items():
+            if mfld == fld.text and norm == typ.replace(b" ", b""):
+                target = p
+                # swallow one redundant paren layer: ((Item*) x->user_data)
+                if target.parent is not None and \
+                        target.parent.type == "parenthesized_expression":
+                    target = target.parent
+                return [(target.start_byte, target.end_byte,
+                         mac + b"(" + arg.text + b")")]
+        return None
+    if fld.text == b"hsd_obj":
+        # jobj is the dominant case; a wrong guess just scores worse
+        mac: Optional[bytes] = b"GET_JOBJ"
+    else:
+        mac = None
+        t = ctx.types.get((arg.start_byte, arg.end_byte)) if ctx.types else None
+        if t:
+            tb = t.encode()
+            for gtyp, m in _USER_DATA_MACRO_BY_GOBJ_TYPE:
+                if gtyp in tb:
+                    mac = m
+                    break
+        if mac is None:
+            mac = _user_data_macro_from_decl(n)
+    if mac is None:
+        return None
+    return [(n.start_byte, n.end_byte, mac + b"(" + arg.text + b")")]
+
+
+def p_gobj_accessor(ctx: Ctx) -> Optional[List[Edit]]:
+    """Swap GET_ITEM(x)-style accessor macros with their direct field form
+    `((Item*) x->user_data)` and back; also expands bare HSD_GObjGetUserData /
+    HSD_GObjGetHSDObj calls. Both forms emit identical instructions; the
+    macro/inline form adds an inline instance that perturbs vreg numbering
+    and frame reservation."""
+    cands: List[List[Edit]] = []
+    for n in iter_subtree(ctx.fn):
+        if n.type == "call_expression":
+            fname = field(n, "function")
+            args = field(n, "arguments")
+            if fname is None or args is None:
+                continue
+            actual = [c for c in args.named_children if c.type != "comment"]
+            if len(actual) != 1:
+                continue
+            arg = _paren_arg(actual[0])
+            if fname.text in GOBJ_ACCESSOR_MACROS:
+                typ, fld = GOBJ_ACCESSOR_MACROS[fname.text]
+                cands.append([(n.start_byte, n.end_byte,
+                               b"((" + typ + b") " + arg + b"->" + fld + b")")])
+            elif fname.text in GOBJ_ACCESSOR_INLINES:
+                fld = GOBJ_ACCESSOR_INLINES[fname.text]
+                cands.append([(n.start_byte, n.end_byte, arg + b"->" + fld)])
+        elif n.type == "field_expression":
+            edit = _gobj_field_to_macro(ctx, n)
+            if edit is not None:
+                cands.append(edit)
+    if not cands:
+        return None
+    return ctx.rng.choice(cands)
+
+
 def p_condition(ctx: Ctx) -> Optional[List[Edit]]:
     wrap: List[Node] = []
     unwrap: List[Tuple[Node, Node]] = []
@@ -1821,6 +1967,7 @@ PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("commutative", p_commutative, 5.0),
     ("add_sub", p_add_sub, 5.0),
     ("struct_ref", p_struct_ref, 5.0),
+    ("gobj_accessor", p_gobj_accessor, 5.0),
     ("compound_assignment", p_compound_assignment, 4.0),
     ("pragma_wrap", p_pragma_wrap, 4.0),
     ("volatile_decl", p_volatile_decl, 4.0),

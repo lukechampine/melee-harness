@@ -13,9 +13,9 @@ By default, runs of 5+ matching lines are collapsed into a placeholder, with
 1 line of context kept adjacent to diff lines. Pass --full-diff to disable.
 
 With --summary, one or more functions may be given, and each gets a one-line
-result:
+result (PASS requires zero mismatched rows, not just a rounded 100.00%):
   function_name: PASS
-  function_name: FAIL (87.45%)
+  function_name: FAIL (87.45% (3 register, 1 stack))
 """
 
 from __future__ import annotations
@@ -120,6 +120,16 @@ def is_matching_line(line: str) -> bool:
     return not line or line[0].isspace()
 
 
+def has_mismatch(two_col_output: str) -> bool:
+    """True if any two-column diff row is flagged (marker char in column 0).
+    objdiff's percent output rounds (e.g. 99.997% prints as 100.00), so the
+    rows are the only trustworthy signal of a true match."""
+    return any(
+        "|" in line and not is_matching_line(line)
+        for line in two_col_output.splitlines()
+    )
+
+
 def collapse_matching(output: str) -> str:
     """Replace runs of `MATCH_SKIP_THRESHOLD`+ matching lines with a placeholder,
     keeping `CONTEXT_LINES` of context adjacent to diff lines."""
@@ -179,7 +189,12 @@ def check_single(func_name: str, full_diff: bool) -> int:
     print(out, end="")
     if result.stderr:
         print(result.stderr, file=sys.stderr, end="")
-    return result.returncode
+    rc = result.returncode
+    if rc == 0 and has_mismatch(result.stdout):
+        print("note: percent rounds up to 100.00 but mismatched rows remain; "
+              "this is NOT a match", file=sys.stderr)
+        rc = 1
+    return rc
 
 
 def check_multiple(func_names: list[str]) -> int:
@@ -200,12 +215,13 @@ def check_multiple(func_names: list[str]) -> int:
             continue
 
         for func_name in funcs:
-            result = run_diff(obj_path, compiled.obj, func_name, fmt="percent", capture=True)
-            percent = result.stdout.strip()
-            if percent == "100.00":
+            result = run_diff(obj_path, compiled.obj, func_name, capture=True)
+            lines = result.stdout.splitlines()
+            header = lines[0].strip() if lines else "no output"
+            if result.returncode == 0 and not has_mismatch(result.stdout):
                 print(f"{func_name}: PASS")
             else:
-                print(f"{func_name}: FAIL ({percent}%)")
+                print(f"{func_name}: FAIL ({header})")
                 rc = 1
 
     return rc
