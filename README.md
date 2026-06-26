@@ -7,7 +7,8 @@ decomp project.
 
 Every script in this repo's `tools/` (`decomp.py`, `checkdiff.py`,
 `permute.py`, `infer_struct.py`, `mwcc_dump.py`, `mwcc_diagnose.py`, `fix_includes.py`,
-`gen_item_state_table.py`) is run in place against a melee checkout:
+`gen_item_state_table.py`, `sdata2_order.py`) is run in place against a melee
+checkout:
 
 ```sh
 # from anywhere inside the checkout, MELEE_ROOT is auto-detected:
@@ -56,9 +57,37 @@ m2c/                   vendored m2c fork (the decompiler tools/decomp.py
 | `infer_struct.py` | struct field inference |
 | `fix_includes.py` | include fixer |
 | `gen_item_state_table.py` | item state-table generator |
+| `sdata2_order.py` | generate or replace a `static void sdata2_order(void)` helper from the reference object's `.sdata2` float/double constants, using `(void) <constant>;` statements, then compile the TU and report whether non-gap `.sdata2` bytes now match |
 | `mwcc_dump.py` | dump the mwcc_debug compiler's listing for one function → `pcdump.txt` |
 | `mwcc_diagnose.py` | mode-oriented mismatch diagnostics that combine checkdiff/objdiff with mwcc_dump |
 | `find_stale_nonmatching_tus.py` | list `Object(NonMatching, ...)` TUs whose reported functions are all 100% matched, so `configure.py` can be flipped |
+
+#### sdata2_order.py
+
+Use this when a TU's `.sdata2` float/double constants are present but ordered
+incorrectly. The tool reads the desired order from the reference object,
+generates a conventional no-op ordering helper, writes it to the source file,
+compiles the TU, and prints whether the non-gap `.sdata2` constants now match.
+
+```sh
+MELEE_ROOT=~/melee uv run --project ~/melee-harness \
+    ~/melee-harness/tools/sdata2_order.py src/melee/it/items/itlinkhookshot.c
+```
+
+Generated helpers use the existing hand-written style:
+
+```c
+static void sdata2_order(void)
+{
+    (void) 0.0f;
+    (void) 1.0f;
+}
+```
+
+Trailing zero padding/gap symbols are ignored. Extra non-gap constants are not:
+if a source file already declares explicit `.sdata2` globals and MWCC also
+pools local literals for the same values, the tool reports that other work
+remains instead of calling the section fixed.
 
 ### .claude/hooks/
 
