@@ -319,6 +319,77 @@ def p_compound_assignment(ctx: Ctx) -> Optional[List[Edit]]:
     return [(n.start_byte, n.end_byte, l.text + b" = " + l.text + b" " + base + b" " + r.text)]
 
 
+def _simple_assignment_stmt(stmt: Node) -> Optional[Tuple[Node, Node, Node]]:
+    if stmt.type != "expression_statement":
+        return None
+    expr = only_named(stmt)
+    if expr is None or expr.type != "assignment_expression":
+        return None
+    op = field(expr, "operator")
+    lhs = field(expr, "left")
+    rhs = field(expr, "right")
+    if op is None or lhs is None or rhs is None or op.text != b"=":
+        return None
+    return lhs, rhs, expr
+
+
+def _assignment_rhs_fold_ok(rhs: Node) -> bool:
+    if rhs.type in (
+        "identifier",
+        "number_literal",
+        "true",
+        "false",
+        "null",
+        "field_expression",
+    ):
+        return True
+    if rhs.type == "cast_expression":
+        val = field(rhs, "value")
+        return val is not None and _assignment_rhs_fold_ok(val)
+    return False
+
+
+def _assignment_lhs_fold_ok(lhs: Node) -> bool:
+    if lhs.type in ("identifier", "field_expression"):
+        return not any(
+            n.type in ("call_expression", "update_expression",
+                       "assignment_expression")
+            for n in iter_subtree(lhs)
+        )
+    return False
+
+
+def p_fold_duplicate_assignment(ctx: Ctx) -> Optional[List[Edit]]:
+    """Fold a previous same-RHS assignment into a later assignment's RHS.
+
+    `a = 0; ... b = 0;` -> `a = 0; ... b = (a = 0);`
+
+    This mirrors several recent MWCC web-number perturbations. The original
+    assignment is intentionally retained, so final values are unchanged.
+    """
+    cands: list[Tuple[Node, Node, Node]] = []
+    for comp in iter_subtree(ctx.fn):
+        if comp.type != "compound_statement":
+            continue
+        prior: list[Tuple[Node, Node, Node]] = []
+        for child in comp.named_children:
+            parts = _simple_assignment_stmt(child)
+            if parts is None:
+                continue
+            lhs, rhs, _expr = parts
+            if not _assignment_lhs_fold_ok(lhs) or not _assignment_rhs_fold_ok(rhs):
+                continue
+            for prev_lhs, prev_rhs, _prev_expr in prior:
+                if prev_rhs.text == rhs.text and prev_lhs.text != lhs.text:
+                    cands.append((rhs, prev_lhs, prev_rhs))
+            prior.append((lhs, rhs, parts[2]))
+    if not cands:
+        return None
+    rhs, prev_lhs, prev_rhs = ctx.rng.choice(cands)
+    return [(rhs.start_byte, rhs.end_byte,
+             b"(" + prev_lhs.text + b" = " + prev_rhs.text + b")")]
+
+
 def p_struct_ref(ctx: Ctx) -> Optional[List[Edit]]:
     fwd: List[Tuple] = []
     rev: List[Tuple] = []
@@ -494,6 +565,8 @@ def p_gobj_accessor(ctx: Ctx) -> Optional[List[Edit]]:
 def p_condition(ctx: Ctx) -> Optional[List[Edit]]:
     wrap: List[Node] = []
     unwrap: List[Tuple[Node, Node]] = []
+    neg: List[Tuple[Node, Node]] = []
+    unneg: List[Tuple[Node, Node]] = []
     for n in iter_subtree(ctx.fn):
         if n.type not in ("if_statement", "while_statement", "do_statement"):
             continue
@@ -512,18 +585,62 @@ def p_condition(ctx: Ctx) -> Optional[List[Edit]]:
                     if left is not None:
                         unwrap.append((inner, left))
                     continue
+            if op is not None and op.text == b"==":
+                r = field(inner, "right")
+                if r is not None and r.text == b"0":
+                    left = field(inner, "left")
+                    if left is not None:
+                        neg.append((inner, left))
+                    continue
             if op is not None and op.text in COMPARE_OPS:
                 continue  # already a comparison; don't add noise
+        elif inner.type == "unary_expression":
+            op = field(inner, "operator")
+            arg = field(inner, "argument") or only_named(inner)
+            if op is not None and op.text == b"!" and arg is not None:
+                unneg.append((inner, arg))
+                continue
         wrap.append(inner)
-    choices = [("w", x) for x in wrap] + [("u", x) for x in unwrap]
+    choices = (
+        [("w", x) for x in wrap]
+        + [("u", x) for x in unwrap]
+        + [("n", x) for x in neg]
+        + [("un", x) for x in unneg]
+    )
     if not choices:
         return None
     kind, item = ctx.rng.choice(choices)
     if kind == "w":
         inner = item
         return [(inner.start_byte, inner.end_byte, inner.text + b" != 0")]
-    inner, left = item
-    return [(inner.start_byte, inner.end_byte, left.text)]
+    inner, expr = item
+    if kind == "u":
+        return [(inner.start_byte, inner.end_byte, expr.text)]
+    if kind == "n":
+        return [(inner.start_byte, inner.end_byte, b"!" + _paren_arg(expr))]
+    return [(inner.start_byte, inner.end_byte, expr.text + b" == 0")]
+
+
+def p_bool_return_literal(ctx: Ctx) -> Optional[List[Edit]]:
+    cands: list[Tuple[Node, bytes]] = []
+    for n in iter_subtree(ctx.fn):
+        if n.type != "return_statement":
+            continue
+        expr = only_named(n)
+        if expr is None:
+            continue
+        if expr.text == b"0":
+            cands.append((expr, b"false"))
+        elif expr.text == b"1":
+            cands.append((expr, b"true"))
+        elif expr.text == b"false":
+            cands.append((expr, b"0"))
+        elif expr.text == b"true":
+            cands.append((expr, b"1"))
+    if not cands:
+        return None
+    expr, rep = ctx.rng.choice(cands)
+    return [(expr.start_byte, expr.end_byte, rep)]
 
 
 def p_remove_cast(ctx: Ctx) -> Optional[List[Edit]]:
@@ -730,6 +847,18 @@ def _line_removal_span(src: bytes, node: Node) -> Tuple[int, int]:
     else:
         end += 1
     return start, end
+
+
+def _line_indent(src: bytes, node: Node) -> bytes:
+    line_start = src.rfind(b"\n", 0, node.start_byte) + 1
+    return src[line_start:node.start_byte]
+
+
+def _line_insert_after(src: bytes, node: Node) -> Tuple[int, bytes]:
+    end = src.find(b"\n", node.end_byte)
+    if end < 0:
+        return node.end_byte, b"\n" + _line_indent(src, node)
+    return end + 1, _line_indent(src, node)
 
 
 def _direct_child_under(node: Node, ancestor: Node) -> Optional[Node]:
@@ -1003,6 +1132,108 @@ def p_inline_single_use_temp(ctx: Ctx) -> Optional[List[Edit]]:
     return [(rm_start, rm_end, b""), (use.start_byte, use.end_byte, init.text)]
 
 
+def _decl_text_has_storage(d: Node) -> bool:
+    text = d.text
+    return any(w in text for w in (
+        b"static", b"extern", b"typedef", b"volatile", b"register",
+    ))
+
+
+def p_split_merge_initializer(ctx: Ctx) -> Optional[List[Edit]]:
+    """Toggle `T x = expr;` with `T x; x = expr;` for simple block locals."""
+    cands: list[list[Edit]] = []
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration":
+            continue
+        parent = d.parent
+        if parent is None or parent.type != "compound_statement":
+            continue
+        if _decl_text_has_storage(d):
+            continue
+        parts = _single_decl_parts(d)
+        if parts is None:
+            continue
+        _typ, item, decl, init = parts
+        if _has_node_type(decl, "function_declarator"):
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is None:
+            continue
+        name = ident.text
+        next_child = _next_effective_child(parent, d)
+
+        if init is not None:
+            # Keep C89 declaration zones intact.
+            if next_child is not None and next_child.type == "declaration":
+                continue
+            pos, indent = _line_insert_after(ctx.src, d)
+            cands.append([
+                (item.start_byte, item.end_byte, decl.text),
+                (pos, pos, indent + name + b" = " + init.text + b";\n"),
+            ])
+            continue
+
+        if next_child is None:
+            continue
+        assign = _simple_assignment_stmt(next_child)
+        if assign is None:
+            continue
+        lhs, rhs, _expr = assign
+        if lhs.type != "identifier" or lhs.text != name:
+            continue
+        rm_start, rm_end = _line_removal_span(ctx.src, next_child)
+        cands.append([
+            (decl.end_byte, decl.end_byte, b" = " + rhs.text),
+            (rm_start, rm_end, b""),
+        ])
+
+    if not cands:
+        return None
+    return ctx.rng.choice(cands)
+
+
+def p_alias_initializer(ctx: Ctx) -> Optional[List[Edit]]:
+    """Route an initialized local through a same-typed alias declaration.
+
+    `T x = expr;` -> `T _perm_aliasN = expr; T x = _perm_aliasN;`
+    """
+    cands: list[list[Edit]] = []
+    locals_ = _local_names(ctx.fn)
+    for d in iter_subtree(ctx.fn):
+        if d.type != "declaration":
+            continue
+        parent = d.parent
+        if parent is None or parent.type != "compound_statement":
+            continue
+        if _decl_text_has_storage(d):
+            continue
+        parts = _single_decl_parts(d)
+        if parts is None:
+            continue
+        _typ, _item, decl, init = parts
+        if init is None or _has_node_type(decl, "function_declarator"):
+            continue
+        ident = _decl_identifier_node(decl)
+        if ident is None:
+            continue
+        alias = f"_perm_alias{d.start_byte}".encode()
+        while alias.decode() in locals_:
+            alias += b"_"
+
+        rel_s = ident.start_byte - d.start_byte
+        rel_e = ident.end_byte - d.start_byte
+        alias_decl = d.text[:rel_s] + alias + d.text[rel_e:]
+        cands.append([
+            (d.start_byte, d.start_byte,
+             alias_decl + b"\n" + _line_indent(ctx.src, d)),
+            (init.start_byte, init.end_byte, alias),
+        ])
+
+    if not cands:
+        return None
+    return ctx.rng.choice(cands)
+
+
 def _block_start_insert_site(src: bytes, comp: Node) -> Optional[Tuple[int, bytes]]:
     if not comp.named_children:
         return None
@@ -1068,6 +1299,60 @@ def p_sink_decl_to_use_block(ctx: Ctx) -> Optional[List[Edit]]:
     d, insert_pos, indent = ctx.rng.choice(cands)
     rm_start, rm_end = _line_removal_span(ctx.src, d)
     return [(rm_start, rm_end, b""), (insert_pos, insert_pos, indent + d.text + b"\n")]
+
+
+def _void_anchor_edit(ctx: Ctx, node: Node, name: bytes) -> Optional[Edit]:
+    pos, indent = _line_insert_after(ctx.src, node)
+    if _next_nonblank_line(ctx.src, pos) == b"(void) " + name + b";":
+        return None
+    return pos, pos, indent + b"(void) " + name + b";\n"
+
+
+def p_void_anchor(ctx: Ctx) -> Optional[List[Edit]]:
+    """Insert `(void) local;` liveness anchors.
+
+    These usually emit no instructions, but can perturb MWCC liveness/web
+    construction; several recent item matches used this exact shape.
+    """
+    cands: list[Edit] = []
+    locals_ = _local_names(ctx.fn)
+
+    for n in iter_subtree(ctx.fn):
+        if n.type == "expression_statement":
+            assign = _simple_assignment_stmt(n)
+            if assign is None:
+                continue
+            lhs, _rhs, _expr = assign
+            if lhs.type != "identifier" or lhs.text.decode() not in locals_:
+                continue
+            edit = _void_anchor_edit(ctx, n, lhs.text)
+            if edit is not None:
+                cands.append(edit)
+        elif n.type == "declaration":
+            parent = n.parent
+            if parent is None or parent.type != "compound_statement":
+                continue
+            if _decl_text_has_storage(n):
+                continue
+            parts = _single_decl_parts(n)
+            if parts is None:
+                continue
+            _typ, _item, decl, init = parts
+            if init is None or _has_node_type(decl, "function_declarator"):
+                continue
+            if (next_child := _next_effective_child(parent, n)) is not None and \
+                    next_child.type == "declaration":
+                continue
+            ident = _decl_identifier_node(decl)
+            if ident is None:
+                continue
+            edit = _void_anchor_edit(ctx, n, ident.text)
+            if edit is not None:
+                cands.append(edit)
+
+    if not cands:
+        return None
+    return [ctx.rng.choice(cands)]
 
 
 def p_reorder_params(ctx: Ctx) -> Optional[List[Edit]]:
@@ -1565,6 +1850,258 @@ def p_manual_inline(ctx: Ctx) -> Optional[List[Edit]]:
     return [(s, e, rep)]
 
 
+@dataclass(frozen=True)
+class _ReturnWrapper:
+    params: list[str]
+    expr: Node
+
+
+@dataclass(frozen=True)
+class _OutParamWrapper:
+    params: list[str]
+    out_param: str
+    expr: Node
+
+
+RETURN_WRAPPER_EXPR_TYPES = {
+    "identifier",
+    "number_literal",
+    "string_literal",
+    "char_literal",
+    "true",
+    "false",
+    "null",
+    "call_expression",
+    "field_expression",
+    "subscript_expression",
+    "pointer_expression",
+    "cast_expression",
+    "unary_expression",
+    "parenthesized_expression",
+}
+
+
+def _is_static_inline_fn(fn: Node, src: bytes) -> bool:
+    fdecl = function_declarator_of(fn)
+    if fdecl is None:
+        return False
+    prefix = src[fn.start_byte:fdecl.start_byte]
+    return b"static" in prefix and b"inline" in prefix
+
+
+def _body_items(body: Node) -> list[Node]:
+    return [c for c in body.named_children if c.type != "comment"]
+
+
+def _call_args(call: Node) -> list[Node]:
+    args = field(call, "arguments")
+    return [c for c in args.named_children] if args is not None else []
+
+
+def _addr_of_identifier(n: Node) -> Optional[Node]:
+    if n.type != "pointer_expression":
+        return None
+    op = field(n, "operator")
+    arg = field(n, "argument") or only_named(n)
+    if op is None or op.text != b"&" or arg is None or arg.type != "identifier":
+        return None
+    return arg
+
+
+def _deref_identifier(n: Node) -> Optional[Node]:
+    if n.type != "pointer_expression":
+        return None
+    op = field(n, "operator")
+    arg = field(n, "argument") or only_named(n)
+    if op is None or op.text != b"*" or arg is None or arg.type != "identifier":
+        return None
+    return arg
+
+
+def _identifier_is_field_name(n: Node) -> bool:
+    par = n.parent
+    if par is None or par.type != "field_expression":
+        return False
+    fld = field(par, "field")
+    return _same_span(n, fld)
+
+
+def _expand_expr_bytes(
+    src: bytes,
+    expr: Node,
+    subst: dict[str, bytes],
+    return_wrappers: dict[str, _ReturnWrapper],
+    depth: int = 0,
+) -> bytes:
+    edits: list[Edit] = []
+
+    def visit(n: Node) -> None:
+        if n.type == "call_expression" and depth < 6:
+            name = _call_name(n)
+            wrapper = return_wrappers.get(name or "")
+            if wrapper is not None:
+                args = _call_args(n)
+                if len(args) == len(wrapper.params) and all(
+                    a.type == "identifier" for a in args
+                ):
+                    inner_subst = {
+                        p: _expand_expr_bytes(src, a, subst, return_wrappers,
+                                              depth + 1)
+                        for p, a in zip(wrapper.params, args)
+                    }
+                    rep = _expand_expr_bytes(
+                        src, wrapper.expr, inner_subst, return_wrappers,
+                        depth + 1)
+                    edits.append((n.start_byte, n.end_byte, rep))
+                    return
+        if n.type == "identifier" and not _identifier_is_field_name(n):
+            rep = subst.get(n.text.decode())
+            if rep is not None and rep != n.text:
+                edits.append((n.start_byte, n.end_byte, rep))
+            return
+        for c in n.named_children:
+            visit(c)
+
+    visit(expr)
+    out = bytearray()
+    pos = expr.start_byte
+    for s, e, rep in sorted(edits, key=lambda x: x[0]):
+        if s < pos:
+            continue
+        out += src[pos:s]
+        out += rep
+        pos = e
+    out += src[pos:expr.end_byte]
+    return bytes(out)
+
+
+def _trivial_wrappers(ctx: Ctx) -> tuple[
+    dict[str, _ReturnWrapper],
+    dict[str, _OutParamWrapper],
+]:
+    return_wrappers: dict[str, _ReturnWrapper] = {}
+    out_wrappers: dict[str, _OutParamWrapper] = {}
+    for n in iter_subtree(ctx.root):
+        if n.type != "function_definition" or _same_span(n, ctx.fn):
+            continue
+        if not _is_static_inline_fn(n, ctx.src):
+            continue
+        name = fn_name_of(n)
+        body = body_of(n)
+        if name is None or body is None:
+            continue
+        params = _param_names(n)
+        items = _body_items(body)
+        if len(items) != 1:
+            continue
+        stmt = items[0]
+        if stmt.type == "return_statement":
+            expr = only_named(stmt)
+            if expr is not None and expr.type in RETURN_WRAPPER_EXPR_TYPES:
+                return_wrappers[name] = _ReturnWrapper(params, expr)
+            continue
+        if not _is_static_inline_void(n, ctx.src):
+            continue
+        if stmt.type != "expression_statement":
+            continue
+        expr = only_named(stmt)
+        if expr is None or expr.type != "assignment_expression":
+            continue
+        op = field(expr, "operator")
+        lhs = field(expr, "left")
+        rhs = field(expr, "right")
+        if op is None or op.text != b"=" or lhs is None or rhs is None:
+            continue
+        out_ident = _deref_identifier(lhs)
+        if out_ident is None:
+            continue
+        out_param = out_ident.text.decode()
+        if out_param not in params:
+            continue
+        if any(
+            m.type == "identifier" and m.text == out_ident.text
+            for m in iter_subtree(rhs)
+        ):
+            continue
+        out_wrappers[name] = _OutParamWrapper(params, out_param, rhs)
+    return return_wrappers, out_wrappers
+
+
+def _collapse_trivial_wrapper_sites(ctx: Ctx):
+    return_wrappers, out_wrappers = _trivial_wrappers(ctx)
+
+    for call in iter_subtree(ctx.fn):
+        if call.type != "call_expression":
+            continue
+        name = _call_name(call)
+        if name is None:
+            continue
+
+        out_wrapper = out_wrappers.get(name)
+        if out_wrapper is not None:
+            stmt = call.parent
+            if stmt is None or stmt.type != "expression_statement":
+                continue
+            inner = only_named(stmt)
+            if not _same_span(inner, call):
+                continue
+            args = _call_args(call)
+            if len(args) != len(out_wrapper.params):
+                continue
+            subst: dict[str, bytes] = {}
+            out_lvalue: Optional[Node] = None
+            ok = True
+            for param, arg in zip(out_wrapper.params, args):
+                if param == out_wrapper.out_param:
+                    out_lvalue = _addr_of_identifier(arg)
+                    ok = out_lvalue is not None
+                elif arg.type == "identifier":
+                    subst[param] = arg.text
+                else:
+                    ok = False
+                if not ok:
+                    break
+            if ok and out_lvalue is not None:
+                rhs = _expand_expr_bytes(
+                    ctx.src, out_wrapper.expr, subst, return_wrappers)
+                yield (stmt.start_byte, stmt.end_byte,
+                       out_lvalue.text + b" = " + rhs + b";")
+            continue
+
+        ret_wrapper = return_wrappers.get(name)
+        if ret_wrapper is None:
+            continue
+        args = _call_args(call)
+        if len(args) != len(ret_wrapper.params) or not all(
+            a.type == "identifier" for a in args
+        ):
+            continue
+        subst = {
+            p: _expand_expr_bytes(ctx.src, a, {}, return_wrappers)
+            for p, a in zip(ret_wrapper.params, args)
+        }
+        rep = _expand_expr_bytes(ctx.src, ret_wrapper.expr, subst,
+                                 return_wrappers)
+        yield (call.start_byte, call.end_byte, rep)
+
+
+def p_collapse_trivial_wrapper(ctx: Ctx) -> Optional[List[Edit]]:
+    """Collapse tiny `static inline` wrapper calls.
+
+    Covers two common MWCC register-allocation levers:
+      * `helper(x, &out);` where helper's body is `*out = expr;`
+      * value wrappers whose body is just `return expr;`
+
+    Arguments are deliberately restricted to identifiers, except for the
+    address-taken out-param, to avoid changing evaluation count or order.
+    """
+    sites = list(_collapse_trivial_wrapper_sites(ctx))
+    if not sites:
+        return None
+    s, e, rep = ctx.rng.choice(sites)
+    return [(s, e, rep)]
+
+
 def _storage_base(lv: Optional[Node]) -> Optional[str]:
     """Variable whose own storage a write to `lv` modifies, or None if the path
     dereferences a pointer (-> or *) -- then a pointee changes, not a local."""
@@ -2037,11 +2574,16 @@ PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("inline_block", p_inline_block, 12.0),
     ("manual_inline", p_manual_inline, 12.0),
     ("multi_inline", p_multi_inline, 10.0),
+    ("collapse_trivial_wrapper", p_collapse_trivial_wrapper, 10.0),
     ("reorder_decls", p_reorder_decls, 10.0),
     ("reorder_stmts", p_reorder_stmts, 10.0),
     ("sink_decl_to_use_block", p_sink_decl_to_use_block, 8.0),
+    ("split_merge_initializer", p_split_merge_initializer, 8.0),
+    ("alias_initializer", p_alias_initializer, 8.0),
     ("inline_single_use_temp", p_inline_single_use_temp, 8.0),
     ("reorder_params", p_reorder_params, 6.0),
+    ("void_anchor", p_void_anchor, 6.0),
+    ("fold_duplicate_assignment", p_fold_duplicate_assignment, 6.0),
     ("commutative", p_commutative, 5.0),
     ("add_sub", p_add_sub, 5.0),
     ("struct_ref", p_struct_ref, 5.0),
@@ -2050,6 +2592,7 @@ PASSES: List[Tuple[str, Callable[[Ctx], Optional[List[Edit]]], float]] = [
     ("pragma_wrap", p_pragma_wrap, 4.0),
     ("volatile_decl", p_volatile_decl, 4.0),
     ("condition", p_condition, 4.0),
+    ("bool_return_literal", p_bool_return_literal, 4.0),
     ("noop_branch", p_noop_branch, 4.0),
     ("remove_cast", p_remove_cast, 3.0),
     ("pad_stack", p_pad_stack, 3.0),
